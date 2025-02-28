@@ -1,5 +1,5 @@
 name: astrbot-github-cards # 插件名称
-desc: 根据群聊中 GitHub 相关链接自动发送 GitHub OpenGraph 图片 # 插件描述
+desc: 根据聊天中 GitHub 相关链接自动发送 GitHub 仓库简介/issue/pr卡片 # 插件描述
 help: 
 version: 1.0.0 # 插件版本
 author: Soulter # 插件作者
