@@ -1,0 +1,20 @@
+{
+  "github_token": {
+    "description": "GitHub API访问令牌",
+    "type": "string",
+    "hint": "可选项。提供GitHub API令牌可以增加API请求限制以及访问私有仓库。格式如: ghp_xxxxxx",
+    "obvious_hint": true
+  },
+  "check_interval": {
+    "description": "检查更新间隔时间（分钟）",
+    "type": "int",
+    "hint": "设置检查GitHub更新的间隔时间，单位为分钟",
+    "default": 30
+  },
+  "use_lowercase_repo": {
+    "description": "仓库名使用小写存储",
+    "type": "bool",
+    "hint": "将仓库名转换为小写进行存储，以避免大小写敏感性问题",
+    "default": true
+  }
+}
