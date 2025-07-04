@@ -4,6 +4,7 @@ import json
 import os
 import aiohttp
 import asyncio
+import base64
 import astrbot.api.message_components as Comp
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -15,6 +16,7 @@ GITHUB_URL_PATTERN = r"https://github\.com/[\w\-]+/[\w\-]+(?:/(pull|issues)/\d+)
 GITHUB_REPO_OPENGRAPH = "https://opengraph.githubassets.com/{hash}/{appendix}"
 STAR_HISTORY_URL = "https://api.star-history.com/svg?repos={identifier}&type=Date"
 GITHUB_API_URL = "https://api.github.com/repos/{repo}"
+GITHUB_README_API_URL = "https://api.github.com/repos/{repo}/readme"  # 新增 README API URL
 GITHUB_ISSUES_API_URL = "https://api.github.com/repos/{repo}/issues"
 GITHUB_ISSUE_API_URL = "https://api.github.com/repos/{repo}/issues/{issue_number}"
 GITHUB_PR_API_URL = "https://api.github.com/repos/{repo}/pulls/{pr_number}"
@@ -30,7 +32,7 @@ DEFAULT_REPO_FILE = "data/github_default_repos.json"
     "astrbot_plugin_github_cards",
     "Soulter",
     "根据群聊中 GitHub 相关链接自动发送 GitHub OpenGraph 图片，支持订阅仓库的 Issue 和 PR",
-    "1.2.0",
+    "1.0.2", 
     "https://github.com/Soulter/astrbot_plugin_github_cards",
 )
 class MyPlugin(Star):
@@ -50,6 +52,7 @@ class MyPlugin(Star):
             f"GitHub Cards Plugin初始化完成，检查间隔: {self.check_interval}分钟"
         )
 
+    # ... (保留所有现有方法 _load_subscriptions 到 _format_rate_limit)
     def _load_subscriptions(self) -> Dict[str, List[str]]:
         """Load subscriptions from JSON file"""
         if os.path.exists(SUBSCRIPTION_FILE):
@@ -519,8 +522,8 @@ class MyPlugin(Star):
         self, reference: str, msg_origin: str = None
     ) -> Tuple[Optional[str], Optional[str]]:
         """Parse issue/PR reference string in various formats"""
-        # Try format 'owner/repo#number'
-        match = re.match(r"([\w\-]+/[\w\-]+)#(\d+)$", reference)
+        # Try format 'owner/repo#number' or 'owner/repo number'
+        match = re.match(r"([\w\-]+/[\w\-]+)(?:#|\s+)(\d+)$", reference)
         if match:
             return match.group(1), match.group(2)
 
@@ -550,6 +553,77 @@ class MyPlugin(Star):
                     )
 
         return None, None
+        
+    def _parse_readme_reference(self, reference: str) -> Optional[str]:
+        """Parse readme reference string."""
+        # Match 'owner/repo' and optional '#...' or ' ...' part
+        match = re.match(r"([\w\-]+/[\w\-]+)", reference)
+        if match:
+            return match.group(1)
+        return None
+
+    @filter.command("ghreadme")
+    async def get_readme_details(self, event: AstrMessageEvent, readme_ref: str):
+        """查询指定仓库的 README 信息。例如: /ghreadme 用户名/仓库名"""
+        repo = self._parse_readme_reference(readme_ref)
+        if not repo:
+            yield event.plain_result(
+                "请提供有效的仓库引用，格式为：用户名/仓库名"
+            )
+            return
+
+        try:
+            readme_data = await self._fetch_readme_data(repo)
+            if not readme_data:
+                yield event.plain_result(
+                    f"无法获取仓库 {repo} 的 README 信息，可能不存在或无访问权限"
+                )
+                return
+            
+            # Decode content from base64
+            content_base64 = readme_data.get("content", "")
+            try:
+                readme_content = base64.b64decode(content_base64).decode("utf-8")
+            except Exception as e:
+                logger.error(f"解码 README 内容失败: {e}")
+                yield event.plain_result(f"解码仓库 {repo} 的 README 内容时出错")
+                return
+
+            # **[REMOVED]** Truncation logic is removed.
+            
+            header = f"📖 {repo} 的 README\n\n"
+            full_text = header + readme_content
+
+            # Render text to image
+            try:
+                image_url = await self.text_to_image(full_text)
+                yield event.image_result(image_url)
+            except Exception as e:
+                logger.error(f"渲染 README 图片失败: {e}")
+                # Fallback to plain text if image rendering fails
+                yield event.plain_result(full_text)
+
+        except Exception as e:
+            logger.error(f"获取 README 详情时出错: {e}")
+            yield event.plain_result(f"获取 README 详情时出错: {str(e)}")
+
+
+    async def _fetch_readme_data(self, repo: str) -> Optional[Dict]:
+        """Fetch README data from GitHub API"""
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = GITHUB_README_API_URL.format(repo=repo)
+                async with session.get(url, headers=self._get_github_headers()) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.error(
+                            f"获取 README {repo} 失败: {resp.status}"
+                        )
+                        return None
+            except Exception as e:
+                logger.error(f"获取 README {repo} 时出错: {e}")
+                return None
 
     async def _fetch_issue_data(self, repo: str, issue_number: str) -> Optional[Dict]:
         """Fetch issue data from GitHub API"""
