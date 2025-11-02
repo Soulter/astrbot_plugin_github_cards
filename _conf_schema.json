@@ -16,5 +16,35 @@
     "type": "bool",
     "hint": "将仓库名转换为小写进行存储，以避免大小写敏感性问题",
     "default": true
+  },
+  "enable_webhook": {
+    "description": "启用 GitHub Webhook 模式",
+    "type": "bool",
+    "hint": "开启后将启动 Webhook 服务并关闭轮询检查",
+    "default": false
+  },
+  "webhook_host": {
+    "description": "Webhook 服务监听地址",
+    "type": "string",
+    "hint": "例如 0.0.0.0 或 127.0.0.1",
+    "default": "0.0.0.0"
+  },
+  "webhook_port": {
+    "description": "Webhook 服务监听端口",
+    "type": "int",
+    "hint": "选择一个对外暴露的端口号",
+    "default": 6192
+  },
+  "webhook_path": {
+    "description": "Webhook 请求路径",
+    "type": "string",
+    "hint": "GitHub Webhook 配置中的路径，需以/开头",
+    "default": "/github/webhook"
+  },
+  "webhook_secret": {
+    "description": "Webhook 验证密钥",
+    "type": "string",
+    "hint": "与 GitHub Webhook 设置中的 Secret 保持一致以验证请求",
+    "default": ""
   }
 }

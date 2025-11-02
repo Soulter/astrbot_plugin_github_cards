@@ -1,6 +1,6 @@
 name: astrbot_plugin_github_cards # 插件名称
 desc: GitHub 相关链接自动发送 GitHub 仓库简介/issue/pr卡片、订阅 GitHub 仓库事件 # 插件描述
-help: 
-version: 1.0.2 # 插件版本
+help:
+version: 1.1.0 # 插件版本
 author: Soulter # 插件作者
 repo: https://github.com/Soulter/astrbot_plugin_github_cards

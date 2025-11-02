@@ -1,22 +1,34 @@
-import re
-import uuid
-import json
-import os
-import aiohttp
 import asyncio
 import base64
-import astrbot.api.message_components as Comp
+import json
+import os
+import re
+import sys
+import uuid
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from typing import Any
+
+import aiohttp
+import formatters
+
+import astrbot.api.message_components as Comp
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger, AstrBotConfig
+
+from .webhook_server import GitHubWebhookServer
+
+PLUGIN_DIR = os.path.dirname(__file__)
+if PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, PLUGIN_DIR)
 
 GITHUB_URL_PATTERN = r"https://github\.com/[\w\-]+/[\w\-]+(?:/(pull|issues)/\d+)?"
 GITHUB_REPO_OPENGRAPH = "https://opengraph.githubassets.com/{hash}/{appendix}"
 STAR_HISTORY_URL = "https://api.star-history.com/svg?repos={identifier}&type=Date"
 GITHUB_API_URL = "https://api.github.com/repos/{repo}"
-GITHUB_README_API_URL = "https://api.github.com/repos/{repo}/readme"  # 新增 README API URL
+GITHUB_README_API_URL = (
+    "https://api.github.com/repos/{repo}/readme"  # 新增 README API URL
+)
 GITHUB_ISSUES_API_URL = "https://api.github.com/repos/{repo}/issues"
 GITHUB_ISSUE_API_URL = "https://api.github.com/repos/{repo}/issues/{issue_number}"
 GITHUB_PR_API_URL = "https://api.github.com/repos/{repo}/pulls/{pr_number}"
@@ -32,11 +44,11 @@ DEFAULT_REPO_FILE = "data/github_default_repos.json"
     "astrbot_plugin_github_cards",
     "Soulter",
     "根据群聊中 GitHub 相关链接自动发送 GitHub OpenGraph 图片，支持订阅仓库的 Issue 和 PR",
-    "1.0.2", 
+    "1.1.0",
     "https://github.com/Soulter/astrbot_plugin_github_cards",
 )
 class MyPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig = None):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
         self.subscriptions = self._load_subscriptions()
@@ -45,19 +57,37 @@ class MyPlugin(Star):
         self.use_lowercase = self.config.get("use_lowercase_repo", True)
         self.github_token = self.config.get("github_token", "")
         self.check_interval = self.config.get("check_interval", 30)
+        self.enable_webhook = bool(self.config.get("enable_webhook", False))
+        self.webhook_host = self.config.get("webhook_host", "0.0.0.0")
+        self.webhook_port = int(self.config.get("webhook_port", 6192))
+        self.webhook_secret = self.config.get("webhook_secret", "")
+        self.webhook_path = self.config.get("webhook_path", "/github/webhook")
+        self.webhook_server: Any | None = None
+        self.task: asyncio.Task[Any] | None = None
 
-        # Start background task to check for updates
-        self.task = asyncio.create_task(self._check_updates_periodically())
-        logger.info(
-            f"GitHub Cards Plugin初始化完成，检查间隔: {self.check_interval}分钟"
-        )
+        if self.enable_webhook:
+            server = GitHubWebhookServer(
+                plugin=self,
+                host=self.webhook_host,
+                port=self.webhook_port,
+                secret=self.webhook_secret,
+                path=self.webhook_path,
+            )
+            self.webhook_server = server
+            server.start()
+            logger.info("GitHub Cards Plugin 初始化完成，启用 Webhook 模式")
+        else:
+            # Start background task to check for updates when webhook is disabled
+            self.task = asyncio.create_task(self._check_updates_periodically())
+            logger.info(
+                f"GitHub Cards Plugin初始化完成，检查间隔: {self.check_interval}分钟"
+            )
 
-    # ... (保留所有现有方法 _load_subscriptions 到 _format_rate_limit)
-    def _load_subscriptions(self) -> Dict[str, List[str]]:
+    def _load_subscriptions(self) -> dict[str, list[str]]:
         """Load subscriptions from JSON file"""
         if os.path.exists(SUBSCRIPTION_FILE):
             try:
-                with open(SUBSCRIPTION_FILE, "r", encoding="utf-8") as f:
+                with open(SUBSCRIPTION_FILE, encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
                 logger.error(f"加载订阅数据失败: {e}")
@@ -72,11 +102,11 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"保存订阅数据失败: {e}")
 
-    def _load_default_repos(self) -> Dict[str, str]:
+    def _load_default_repos(self) -> dict[str, str]:
         """Load default repo settings from JSON file"""
         if os.path.exists(DEFAULT_REPO_FILE):
             try:
-                with open(DEFAULT_REPO_FILE, "r", encoding="utf-8") as f:
+                with open(DEFAULT_REPO_FILE, encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
                 logger.error(f"加载默认仓库数据失败: {e}")
@@ -95,7 +125,19 @@ class MyPlugin(Star):
         """Normalize repository name according to configuration"""
         return repo.lower() if self.use_lowercase else repo
 
-    def _get_github_headers(self) -> Dict[str, str]:
+    def _resolve_repo_key(self, repo: str) -> str | None:
+        """Resolve stored subscription key that matches the provided repo name."""
+        if repo in self.subscriptions:
+            return repo
+
+        normalized = self._normalize_repo_name(repo)
+        for stored_repo in self.subscriptions.keys():
+            if self._normalize_repo_name(stored_repo) == normalized:
+                return stored_repo
+
+        return None
+
+    def _get_github_headers(self) -> dict[str, str]:
         """Get GitHub API headers with token if available"""
         headers = {"Accept": "application/vnd.github.v3+json"}
         if self.github_token:
@@ -107,6 +149,9 @@ class MyPlugin(Star):
         """解析 Github 仓库信息"""
         msg = event.message_str
         match = re.search(GITHUB_URL_PATTERN, msg)
+        if not match:
+            logger.debug("未能在消息中解析到 GitHub 链接")
+            return
         repo_url = match.group(0)
         repo_url = repo_url.replace("https://github.com/", "")
         hash_value = uuid.uuid4().hex
@@ -150,27 +195,30 @@ class MyPlugin(Star):
         # Get the unique identifier for the subscriber
         subscriber_id = event.unified_msg_origin
 
-        # Add or update subscription
-        if normalized_repo not in self.subscriptions:
-            self.subscriptions[repo] = []
+        repo_key = self._resolve_repo_key(repo)
+        if not repo_key:
+            repo_key = normalized_repo if self.use_lowercase else display_name
 
-        if subscriber_id not in self.subscriptions[repo]:
-            self.subscriptions[repo].append(subscriber_id)
+        subscribers = self.subscriptions.setdefault(repo_key, [])
+
+        if subscriber_id not in subscribers:
+            subscribers.append(subscriber_id)
             self._save_subscriptions()
 
             # Fetch initial state for new subscription
-            await self._fetch_new_items(normalized_repo, None)
+            if not self.enable_webhook:
+                await self._fetch_new_items(repo_key, None)
 
-            yield event.plain_result(f"成功订阅仓库 {display_name} 的 Issue 和 PR 更新")
+            yield event.plain_result(f"成功订阅仓库 {display_name} 的事件更新。")
         else:
             yield event.plain_result(f"你已经订阅了仓库 {display_name}")
 
         # Set as default repo for this conversation
-        self.default_repos[event.unified_msg_origin] = repo
+        self.default_repos[event.unified_msg_origin] = display_name
         self._save_default_repos()
 
     @filter.command("ghunsub")
-    async def unsubscribe_repo(self, event: AstrMessageEvent, repo: str = None):
+    async def unsubscribe_repo(self, event: AstrMessageEvent, repo: str | None = None):
         """取消订阅 GitHub 仓库。例如: /ghunsub Soulter/AstrBot，不提供仓库名则取消所有订阅"""
         subscriber_id = event.unified_msg_origin
 
@@ -197,26 +245,14 @@ class MyPlugin(Star):
             yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
             return
 
-        # Normalize repository name
-        normalized_repo = self._normalize_repo_name(repo)
-
-        # Find the repo case-insensitively if using lowercase
-        if self.use_lowercase:
-            matched_repos = [
-                r for r in self.subscriptions.keys() if r.lower() == normalized_repo
-            ]
-            if matched_repos:
-                normalized_repo = matched_repos[0]
-
-        if (
-            normalized_repo in self.subscriptions
-            and subscriber_id in self.subscriptions[normalized_repo]
-        ):
-            self.subscriptions[normalized_repo].remove(subscriber_id)
-            if not self.subscriptions[normalized_repo]:
-                del self.subscriptions[normalized_repo]
+        repo_key = self._resolve_repo_key(repo)
+        if repo_key and subscriber_id in self.subscriptions.get(repo_key, []):
+            self.subscriptions[repo_key].remove(subscriber_id)
+            if not self.subscriptions[repo_key]:
+                del self.subscriptions[repo_key]
             self._save_subscriptions()
-            yield event.plain_result(f"已取消订阅仓库 {repo}")
+            self.last_check_time.pop(repo_key, None)
+            yield event.plain_result(f"已取消订阅仓库 {repo_key}")
         else:
             yield event.plain_result(f"你没有订阅仓库 {repo}")
 
@@ -238,7 +274,7 @@ class MyPlugin(Star):
             yield event.plain_result("你当前没有订阅任何仓库")
 
     @filter.command("ghdefault", alias={"ghdef"})
-    async def set_default_repo(self, event: AstrMessageEvent, repo: str = None):
+    async def set_default_repo(self, event: AstrMessageEvent, repo: str | None = None):
         """设置默认仓库。例如: /ghdefault Soulter/AstrBot"""
         if repo is None:
             # Show current default repo
@@ -273,7 +309,7 @@ class MyPlugin(Star):
             return
 
         # Set as default repo for this conversation
-        self.default_repos[event.unified_msg_origin] = repo
+        self.default_repos[event.unified_msg_origin] = display_name
         self._save_default_repos()
         yield event.plain_result(f"已将 {display_name} 设为默认仓库")
 
@@ -283,6 +319,10 @@ class MyPlugin(Star):
 
     async def _check_updates_periodically(self):
         """Periodically check for updates in subscribed repositories"""
+        if self.enable_webhook:
+            logger.debug("Webhook 模式已启用，跳过轮询任务")
+            return
+
         try:
             while True:
                 try:
@@ -299,6 +339,9 @@ class MyPlugin(Star):
 
     async def _check_all_repos(self):
         """Check all subscribed repositories for updates"""
+        if self.enable_webhook:
+            return
+
         for repo in list(self.subscriptions.keys()):
             logger.info(f"正在检查仓库 {repo} 更新")
             if not self.subscriptions[repo]:  # Skip if no subscribers
@@ -320,7 +363,7 @@ class MyPlugin(Star):
             except Exception as e:
                 logger.error(f"检查仓库 {repo} 更新时出错: {e}")
 
-    async def _fetch_new_items(self, repo: str, last_check: str):
+    async def _fetch_new_items(self, repo: str, last_check: str | None):
         """Fetch new issues and PRs from a repository since last check"""
         if not last_check:
             # If first time checking, just record current time and return empty list
@@ -413,12 +456,14 @@ class MyPlugin(Star):
             )
             return []
 
-    async def _notify_subscribers(self, repo: str, new_items: List[Dict]):
+    async def _notify_subscribers(self, repo: str, new_items: list[dict[str, Any]]):
         """Notify subscribers about new issues and PRs"""
         if not new_items:
             return
 
-        for subscriber_id in self.subscriptions.get(repo, []):
+        repo_key = self._resolve_repo_key(repo) or repo
+
+        for subscriber_id in self.subscriptions.get(repo_key, []):
             try:
                 # Create notification message
                 for item in new_items:
@@ -439,6 +484,130 @@ class MyPlugin(Star):
                     await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"向订阅者 {subscriber_id} 发送通知时出错: {e}")
+
+    async def handle_webhook_event(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        """Process incoming GitHub webhook events."""
+        if event_type == "ping":
+            logger.info("收到 GitHub Webhook ping 事件")
+            return
+
+        repo_info = payload.get("repository")
+        if not isinstance(repo_info, dict):
+            logger.warning("GitHub Webhook 事件缺少 repository 信息")
+            return
+
+        repo_full_name = repo_info.get("full_name")
+        if not repo_full_name:
+            logger.warning("GitHub Webhook 事件缺少仓库全名")
+            return
+
+        repo_key = self._resolve_repo_key(repo_full_name)
+        if not repo_key:
+            logger.debug(
+                f"忽略仓库 {repo_full_name} 的 Webhook 事件 {event_type}: 未找到对应订阅"
+            )
+            return
+
+        subscribers = self.subscriptions.get(repo_key, [])
+        if not subscribers:
+            logger.debug(
+                f"仓库 {repo_full_name} 没有订阅者，跳过 Webhook 事件 {event_type}"
+            )
+            return
+
+        sender = payload.get("sender")
+        action = payload.get("action", "")
+        message: str | None = None
+
+        if event_type == "issues":
+            issue = payload.get("issue")
+            if isinstance(issue, dict):
+                message = formatters.format_webhook_issue_message(
+                    repo_full_name, action, issue, sender
+                )
+        elif event_type == "pull_request":
+            pull_request = payload.get("pull_request")
+            if isinstance(pull_request, dict):
+                message = formatters.format_webhook_pr_message(
+                    repo_full_name, action, pull_request, sender
+                )
+        elif event_type == "issue_comment":
+            issue = payload.get("issue")
+            comment = payload.get("comment")
+            if isinstance(issue, dict) and isinstance(comment, dict):
+                message = formatters.format_webhook_issue_comment_message(
+                    repo_full_name, action, issue, comment, sender
+                )
+        elif event_type == "commit_comment":
+            comment = payload.get("comment")
+            if isinstance(comment, dict):
+                message = formatters.format_webhook_commit_comment_message(
+                    repo_full_name, action, comment, sender
+                )
+        elif event_type == "discussion":
+            discussion = payload.get("discussion")
+            if isinstance(discussion, dict):
+                message = formatters.format_webhook_discussion_message(
+                    repo_full_name, action, discussion, sender
+                )
+        elif event_type == "discussion_comment":
+            discussion = payload.get("discussion")
+            comment = payload.get("comment")
+            if isinstance(discussion, dict) and isinstance(comment, dict):
+                message = formatters.format_webhook_discussion_comment_message(
+                    repo_full_name, action, discussion, comment, sender
+                )
+        elif event_type == "fork":
+            message = formatters.format_webhook_fork_message(
+                repo_full_name, payload.get("forkee"), sender
+            )
+        elif event_type == "pull_request_review_comment":
+            pull_request = payload.get("pull_request")
+            comment = payload.get("comment")
+            if isinstance(pull_request, dict) and isinstance(comment, dict):
+                message = formatters.format_webhook_pr_review_comment_message(
+                    repo_full_name, action, pull_request, comment, sender
+                )
+        elif event_type == "pull_request_review":
+            pull_request = payload.get("pull_request")
+            review = payload.get("review")
+            if isinstance(pull_request, dict) and isinstance(review, dict):
+                message = formatters.format_webhook_pr_review_message(
+                    repo_full_name, action, pull_request, review, sender
+                )
+        elif event_type == "pull_request_review_thread":
+            pull_request = payload.get("pull_request")
+            thread = payload.get("thread")
+            if isinstance(pull_request, dict) and isinstance(thread, dict):
+                message = formatters.format_webhook_pr_review_thread_message(
+                    repo_full_name, action, pull_request, thread, sender
+                )
+        elif event_type == "star":
+            message = formatters.format_webhook_star_message(
+                repo_full_name, action, sender
+            )
+        elif event_type == "create":
+            message = formatters.format_webhook_create_message(
+                repo_full_name, payload, sender
+            )
+        else:
+            logger.debug(f"暂不处理的 GitHub Webhook 事件类型: {event_type}")
+            return
+
+        if not message:
+            logger.debug(f"Webhook 事件 {event_type} 未生成通知，可能是不支持的 action")
+            return
+
+        for subscriber_id in subscribers:
+            try:
+                await self.context.send_message(
+                    subscriber_id, MessageChain(chain=[Comp.Plain(message)])
+                )
+                await asyncio.sleep(1)
+            except Exception as exc:
+                logger.error(f"向订阅者 {subscriber_id} 发送 Webhook 通知时出错: {exc}")
 
     @filter.command("ghissue", alias={"ghis"})
     async def get_issue_details(self, event: AstrMessageEvent, issue_ref: str):
@@ -461,7 +630,7 @@ class MyPlugin(Star):
                 return
 
             # Format and send the issue details
-            result = self._format_issue_details(repo, issue_data)
+            result = formatters.format_issue_details(repo, issue_data)
             yield event.plain_result(result)
 
             # Send the issue card image if available
@@ -499,7 +668,7 @@ class MyPlugin(Star):
                 return
 
             # Format and send the PR details
-            result = self._format_pr_details(repo, pr_data)
+            result = formatters.format_pr_details(repo, pr_data)
             yield event.plain_result(result)
 
             # Send the PR card image if available
@@ -519,8 +688,8 @@ class MyPlugin(Star):
             yield event.plain_result(f"获取 PR 详情时出错: {str(e)}")
 
     def _parse_issue_reference(
-        self, reference: str, msg_origin: str = None
-    ) -> Tuple[Optional[str], Optional[str]]:
+        self, reference: str, msg_origin: str | None = None
+    ) -> tuple[str | None, str | None]:
         """Parse issue/PR reference string in various formats"""
         # Try format 'owner/repo#number' or 'owner/repo number'
         match = re.match(r"([\w\-]+/[\w\-]+)(?:#|\s+)(\d+)$", reference)
@@ -553,8 +722,8 @@ class MyPlugin(Star):
                     )
 
         return None, None
-        
-    def _parse_readme_reference(self, reference: str) -> Optional[str]:
+
+    def _parse_readme_reference(self, reference: str) -> str | None:
         """Parse readme reference string."""
         # Match 'owner/repo' and optional '#...' or ' ...' part
         match = re.match(r"([\w\-]+/[\w\-]+)", reference)
@@ -567,9 +736,7 @@ class MyPlugin(Star):
         """查询指定仓库的 README 信息。例如: /ghreadme 用户名/仓库名"""
         repo = self._parse_readme_reference(readme_ref)
         if not repo:
-            yield event.plain_result(
-                "请提供有效的仓库引用，格式为：用户名/仓库名"
-            )
+            yield event.plain_result("请提供有效的仓库引用，格式为：用户名/仓库名")
             return
 
         try:
@@ -579,7 +746,7 @@ class MyPlugin(Star):
                     f"无法获取仓库 {repo} 的 README 信息，可能不存在或无访问权限"
                 )
                 return
-            
+
             # Decode content from base64
             content_base64 = readme_data.get("content", "")
             try:
@@ -590,7 +757,7 @@ class MyPlugin(Star):
                 return
 
             # **[REMOVED]** Truncation logic is removed.
-            
+
             header = f"📖 {repo} 的 README\n\n"
             full_text = header + readme_content
 
@@ -607,8 +774,7 @@ class MyPlugin(Star):
             logger.error(f"获取 README 详情时出错: {e}")
             yield event.plain_result(f"获取 README 详情时出错: {str(e)}")
 
-
-    async def _fetch_readme_data(self, repo: str) -> Optional[Dict]:
+    async def _fetch_readme_data(self, repo: str) -> dict[str, Any] | None:
         """Fetch README data from GitHub API"""
         async with aiohttp.ClientSession() as session:
             try:
@@ -617,15 +783,15 @@ class MyPlugin(Star):
                     if resp.status == 200:
                         return await resp.json()
                     else:
-                        logger.error(
-                            f"获取 README {repo} 失败: {resp.status}"
-                        )
+                        logger.error(f"获取 README {repo} 失败: {resp.status}")
                         return None
             except Exception as e:
                 logger.error(f"获取 README {repo} 时出错: {e}")
                 return None
 
-    async def _fetch_issue_data(self, repo: str, issue_number: str) -> Optional[Dict]:
+    async def _fetch_issue_data(
+        self, repo: str, issue_number: str
+    ) -> dict[str, Any] | None:
         """Fetch issue data from GitHub API"""
         async with aiohttp.ClientSession() as session:
             try:
@@ -642,7 +808,7 @@ class MyPlugin(Star):
                 logger.error(f"获取 Issue {repo}#{issue_number} 时出错: {e}")
                 return None
 
-    async def _fetch_pr_data(self, repo: str, pr_number: str) -> Optional[Dict]:
+    async def _fetch_pr_data(self, repo: str, pr_number: str) -> dict[str, Any] | None:
         """Fetch PR data from GitHub API"""
         async with aiohttp.ClientSession() as session:
             try:
@@ -656,111 +822,6 @@ class MyPlugin(Star):
             except Exception as e:
                 logger.error(f"获取 PR {repo}#{pr_number} 时出错: {e}")
                 return None
-
-    def _format_issue_details(self, repo: str, issue_data: Dict) -> str:
-        """Format issue data for display"""
-        # Handle potential PR that was returned from the issues endpoint
-        if "pull_request" in issue_data:
-            return f"#{issue_data['number']} 是一个 PR，请使用 /ghpr 命令查看详情"
-
-        # Parse the datetime and convert to local time for display
-        created_str = issue_data["created_at"].replace("Z", "+00:00")
-        updated_str = issue_data["updated_at"].replace("Z", "+00:00")
-
-        created_at = datetime.fromisoformat(created_str)
-        updated_at = datetime.fromisoformat(updated_str)
-
-        status = "开启" if issue_data["state"] == "open" else "已关闭"
-        labels = ", ".join([label["name"] for label in issue_data.get("labels", [])])
-
-        result = (
-            f"🔍 Issue 详情 | {repo}#{issue_data['number']}\n"
-            f"标题: {issue_data['title']}\n"
-            f"状态: {status}\n"
-            f"创建者: {issue_data['user']['login']}\n"
-            f"创建时间: {created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"更新时间: {updated_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        )
-
-        if labels:
-            result += f"标签: {labels}\n"
-
-        if issue_data.get("assignees") and len(issue_data["assignees"]) > 0:
-            assignees = ", ".join(
-                [assignee["login"] for assignee in issue_data["assignees"]]
-            )
-            result += f"指派给: {assignees}\n"
-
-        if issue_data.get("body"):
-            # Truncate long body text
-            body = issue_data["body"]
-            if len(body) > 200:
-                body = body[:197] + "..."
-            result += f"\n内容概要:\n{body}\n"
-
-        result += f"\n链接: {issue_data['html_url']}"
-        return result
-
-    def _format_pr_details(self, repo: str, pr_data: Dict) -> str:
-        """Format PR data for display"""
-        # Parse the datetime and convert to local time for display
-        created_str = pr_data["created_at"].replace("Z", "+00:00")
-        updated_str = pr_data["updated_at"].replace("Z", "+00:00")
-
-        created_at = datetime.fromisoformat(created_str)
-        updated_at = datetime.fromisoformat(updated_str)
-
-        status = pr_data["state"]
-        if status == "open":
-            status = "开启"
-        elif status == "closed":
-            status = "已关闭" if not pr_data.get("merged") else "已合并"
-
-        labels = ", ".join([label["name"] for label in pr_data.get("labels", [])])
-
-        result = (
-            f"🔀 PR 详情 | {repo}#{pr_data['number']}\n"
-            f"标题: {pr_data['title']}\n"
-            f"状态: {status}\n"
-            f"创建者: {pr_data['user']['login']}\n"
-            f"创建时间: {created_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"更新时间: {updated_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"分支: {pr_data['head']['label']} → {pr_data['base']['label']}\n"
-        )
-
-        if labels:
-            result += f"标签: {labels}\n"
-
-        if (
-            pr_data.get("requested_reviewers")
-            and len(pr_data["requested_reviewers"]) > 0
-        ):
-            reviewers = ", ".join(
-                [reviewer["login"] for reviewer in pr_data["requested_reviewers"]]
-            )
-            result += f"审阅者: {reviewers}\n"
-
-        if pr_data.get("assignees") and len(pr_data["assignees"]) > 0:
-            assignees = ", ".join(
-                [assignee["login"] for assignee in pr_data["assignees"]]
-            )
-            result += f"指派给: {assignees}\n"
-
-        result += (
-            f"增加: +{pr_data.get('additions', 0)} 行\n"
-            f"删除: -{pr_data.get('deletions', 0)} 行\n"
-            f"文件变更: {pr_data.get('changed_files', 0)} 个\n"
-        )
-
-        if pr_data.get("body"):
-            # Truncate long body text
-            body = pr_data["body"]
-            if len(body) > 200:
-                body = body[:197] + "..."
-            result += f"\n内容概要:\n{body}\n"
-
-        result += f"\n链接: {pr_data['html_url']}"
-        return result
 
     @filter.command("ghlimit", alias={"ghrate"})
     async def check_rate_limit(self, event: AstrMessageEvent):
@@ -779,7 +840,7 @@ class MyPlugin(Star):
             logger.error(f"获取 API 速率限制信息时出错: {e}")
             yield event.plain_result(f"获取 API 速率限制信息时出错: {str(e)}")
 
-    async def _fetch_rate_limit(self) -> Optional[Dict]:
+    async def _fetch_rate_limit(self) -> dict[str, Any] | None:
         """Fetch rate limit information from GitHub API"""
         async with aiohttp.ClientSession() as session:
             try:
@@ -795,7 +856,7 @@ class MyPlugin(Star):
                 logger.error(f"获取 API 速率限制信息时出错: {e}")
                 return None
 
-    def _format_rate_limit(self, rate_limit_data: Dict) -> str:
+    def _format_rate_limit(self, rate_limit_data: dict[str, Any]) -> str:
         """Format rate limit data for display"""
         if not rate_limit_data or "resources" not in rate_limit_data:
             return "获取到的速率限制数据无效"
@@ -859,5 +920,13 @@ class MyPlugin(Star):
         """Cleanup and save data before termination"""
         self._save_subscriptions()
         self._save_default_repos()
-        self.task.cancel()
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+        if self.webhook_server:
+            await self.webhook_server.stop()
         logger.info("GitHub Cards Plugin 已终止")
