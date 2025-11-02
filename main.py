@@ -9,13 +9,13 @@ from datetime import datetime
 from typing import Any
 
 import aiohttp
-import formatters
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
+from . import formatters
 from .webhook_server import GitHubWebhookServer
 
 PLUGIN_DIR = os.path.dirname(__file__)
