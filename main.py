@@ -38,6 +38,8 @@ GITHUB_RATE_LIMIT_URL = "https://api.github.com/rate_limit"
 SUBSCRIPTION_FILE = "data/github_subscriptions.json"
 # Path for storing default repo data
 DEFAULT_REPO_FILE = "data/github_default_repos.json"
+# Path for storing link resolution settings
+LINK_SETTINGS_FILE = "data/github_link_settings.json"
 
 
 @register(
@@ -53,8 +55,10 @@ class MyPlugin(Star):
         self.config = config or {}
         self.subscriptions = self._load_subscriptions()
         self.default_repos = self._load_default_repos()
+        self.link_settings = self._load_link_settings()
         self.last_check_time = {}  # Store the last check time for each repo
         self.use_lowercase = self.config.get("use_lowercase_repo", True)
+        self.auto_resolve_links = self.config.get("auto_resolve_links", True)
         self.github_token = self.config.get("github_token", "")
         self.check_interval = self.config.get("check_interval", 30)
         self.enable_webhook = bool(self.config.get("enable_webhook", False))
@@ -121,6 +125,25 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"保存默认仓库数据失败: {e}")
 
+    def _load_link_settings(self) -> dict[str, bool]:
+        """Load link resolution settings from JSON file"""
+        if os.path.exists(LINK_SETTINGS_FILE):
+            try:
+                with open(LINK_SETTINGS_FILE, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"加载链接解析设置失败: {e}")
+        return {}
+
+    def _save_link_settings(self):
+        """Save link resolution settings to JSON file"""
+        try:
+            os.makedirs(os.path.dirname(LINK_SETTINGS_FILE), exist_ok=True)
+            with open(LINK_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.link_settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存链接解析设置失败: {e}")
+
     def _normalize_repo_name(self, repo: str) -> str:
         """Normalize repository name according to configuration"""
         return repo.lower() if self.use_lowercase else repo
@@ -147,6 +170,13 @@ class MyPlugin(Star):
     @filter.regex(GITHUB_URL_PATTERN)
     async def github_repo(self, event: AstrMessageEvent):
         """解析 Github 仓库信息"""
+        # Check if link resolution is enabled for this conversation
+        should_resolve = self.link_settings.get(
+            event.unified_msg_origin, self.auto_resolve_links
+        )
+        if not should_resolve:
+            return
+
         msg = event.message_str
         match = re.search(GITHUB_URL_PATTERN, msg)
         if not match:
@@ -164,6 +194,21 @@ class MyPlugin(Star):
             logger.error(f"下载图片失败: {e}")
             yield event.plain_result("下载 GitHub 图片失败: " + str(e))
             return
+
+    @filter.command("ghlink")
+    async def set_link_resolution(self, event: AstrMessageEvent, state: str):
+        """设置当前会话是否自动解析 GitHub 链接。用法: /ghlink on 或 /ghlink off"""
+        state = state.lower()
+        if state not in ["on", "off"]:
+            yield event.plain_result("无效的参数，请使用 on 或 off")
+            return
+
+        enabled = state == "on"
+        self.link_settings[event.unified_msg_origin] = enabled
+        self._save_link_settings()
+
+        status_text = "开启" if enabled else "关闭"
+        yield event.plain_result(f"已在当前会话{status_text} GitHub 链接自动解析")
 
     @filter.command("ghsub")
     async def subscribe_repo(self, event: AstrMessageEvent, repo: str):
@@ -343,7 +388,7 @@ class MyPlugin(Star):
             return
 
         for repo in list(self.subscriptions.keys()):
-            logger.info(f"正在检查仓库 {repo} 更新")
+            logger.debug(f"正在检查仓库 {repo} 更新")
             if not self.subscriptions[repo]:  # Skip if no subscribers
                 continue
 
@@ -383,7 +428,7 @@ class MyPlugin(Star):
                 # If it somehow has timezone info, convert to naive UTC
                 last_check_dt = last_check_dt.replace(tzinfo=None)
 
-            logger.info(f"仓库 {repo} 的上次检查时间: {last_check_dt.isoformat()}")
+            logger.debug(f"仓库 {repo} 的上次检查时间: {last_check_dt.isoformat()}")
             new_items = []
 
             # GitHub API returns both issues and PRs in the issues endpoint
@@ -411,7 +456,7 @@ class MyPlugin(Star):
                                 # Always remove timezone info for comparison
                                 created_at = created_at.replace(tzinfo=None)
 
-                                logger.info(
+                                logger.debug(
                                     f"比较: 仓库 {repo} 的 item #{item['number']} 创建于 {created_at.isoformat()}, 上次检查: {last_check_dt.isoformat()}"
                                 )
 
@@ -422,11 +467,14 @@ class MyPlugin(Star):
                                     new_items.append(item)
                                 else:
                                     # Since items are sorted by creation time, we can break early
-                                    logger.info(f"没有更多新 items in {repo}")
+                                    logger.debug(f"没有更多新 items in {repo}")
                                     break
                         else:
+                            text = await resp.text()
+                            if len(text) > 100:
+                                text = text[:100] + "..."
                             logger.error(
-                                f"获取仓库 {repo} 的 Issue/PR 失败: {resp.status}: {await resp.text()}"
+                                f"获取仓库 {repo} 的 Issue/PR 失败: {resp.status}: {text}"
                             )
                 except Exception as e:
                     logger.error(f"获取仓库 {repo} 的 Issue/PR 时出错: {e}")
@@ -435,13 +483,13 @@ class MyPlugin(Star):
             if new_items:
                 logger.info(f"找到 {len(new_items)} 个新的 items 在 {repo}")
             else:
-                logger.info(f"没有找到新的 items 在 {repo}")
+                logger.debug(f"没有找到新的 items 在 {repo}")
 
             # Always update the timestamp after checking, regardless of whether we found items
             self.last_check_time[repo] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
-            logger.info(f"更新仓库 {repo} 的时间戳为: {self.last_check_time[repo]}")
+            logger.debug(f"更新仓库 {repo} 的时间戳为: {self.last_check_time[repo]}")
 
             return new_items
         except Exception as e:
@@ -920,6 +968,7 @@ class MyPlugin(Star):
         """Cleanup and save data before termination"""
         self._save_subscriptions()
         self._save_default_repos()
+        self._save_link_settings()
         if self.task:
             self.task.cancel()
             try:
