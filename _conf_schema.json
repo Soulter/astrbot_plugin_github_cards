@@ -17,6 +17,12 @@
     "hint": "将仓库名转换为小写进行存储，以避免大小写敏感性问题",
     "default": true
   },
+  "auto_resolve_links": {
+    "description": "自动解析 GitHub 链接",
+    "type": "bool",
+    "hint": "是否自动解析群聊中的 GitHub 链接并发送卡片。可通过 /ghlink 指令在特定会话中覆盖此设置",
+    "default": true
+  },
   "enable_webhook": {
     "description": "启用 GitHub Webhook 模式",
     "type": "bool",
