@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 from typing import Any
 
 from quart import Quart, Response, request
@@ -52,7 +53,18 @@ class GitHubWebhookServer:
                 return Response("missing event", status=400)
 
             try:
-                data = await request.get_json()
+                if request.is_json:
+                    data = await request.get_json()
+                else:
+                    form_data = await request.form
+                    if "payload" in form_data:
+                        data = json.loads(form_data["payload"])
+                    else:
+                        data = None
+                        
+                if data is None:
+                    logger.warning("GitHub Webhook 缺少有效的 payload 数据")
+                    return Response("invalid payload", status=400)
             except Exception:
                 logger.warning("GitHub Webhook JSON 解析失败")
                 return Response("invalid payload", status=400)

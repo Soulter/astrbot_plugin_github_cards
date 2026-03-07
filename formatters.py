@@ -523,3 +523,80 @@ def format_pr_details(repo: str, pr_data: dict[str, Any]) -> str:
 
     result += f"\n链接: {pr_data['html_url']}"
     return result
+
+
+def format_webhook_push_message(
+    repo: str,
+    payload: dict[str, Any],
+    sender: dict[str, Any] | None,
+) -> str | None:
+    ref = payload.get("ref", "")
+    branch_or_tag = ref.split("/")[-1] if "/" in ref else ref
+    
+    commits = payload.get("commits", [])
+    if not commits:
+        return None
+
+    actor = (sender or {}).get("login") or "未知"
+    
+    message_lines = [
+        f"[GitHub Webhook] 仓库 {repo} 代码推送",
+        f"分支: {branch_or_tag}",
+        f"触发人: {actor}",
+        f"新增 {len(commits)} 个提交:"
+    ]
+
+    for commit in commits[:3]:
+        msg = commit.get("message", "").split("\n")[0]
+        sha = commit.get("id", "")[:7]
+        message_lines.append(f"- {sha} {msg}")
+
+    if len(commits) > 3:
+        message_lines.append(f"... 等共 {len(commits)} 个提交")
+
+    compare_url = payload.get("compare")
+    if compare_url:
+        message_lines.append(f"链接: {compare_url}")
+
+    return "\n".join(message_lines)
+
+
+def format_webhook_release_message(
+    repo: str,
+    action: str,
+    release: dict[str, Any],
+    sender: dict[str, Any] | None,
+) -> str | None:
+    action_labels = {
+        "published": "发布了新版本",
+        "created": "创建了版本",
+        "edited": "更新了版本",
+        "deleted": "删除了版本",
+        "prereleased": "发布了预发布版本",
+        "released": "发布了正式版本",
+    }
+
+    label = action_labels.get(action)
+    if not label:
+        return None
+
+    actor = (sender or {}).get("login") or release.get("author", {}).get("login") or "未知"
+    tag_name = release.get("tag_name", "未知版本")
+    name = release.get("name") or tag_name
+
+    message_lines = [
+        f"[GitHub Webhook] 仓库 {repo} Release 更新",
+        f"版本: {name} ({tag_name})",
+        f"事件: {label}",
+        f"触发人: {actor}",
+    ]
+
+    body = release.get("body", "")
+    if body and action in ["published", "released", "prereleased"]:
+        message_lines.append("发布说明:")
+        message_lines.append(truncate_text(body, limit=200))
+
+    if release.get("html_url"):
+        message_lines.append(f"链接: {release['html_url']}")
+
+    return "\n".join(message_lines)
