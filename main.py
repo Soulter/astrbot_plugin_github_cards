@@ -167,6 +167,32 @@ class MyPlugin(Star):
             headers["Authorization"] = f"token {self.github_token}"
         return headers
 
+    async def _download_card_image(self, url: str) -> str:
+        """下载 GitHub OpenGraph 图片到本地临时目录，返回本地绝对路径。如果下载失败则返回原 URL。"""
+        hash_value = uuid.uuid4().hex
+        temp_dir = os.path.join("data", "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        local_path = os.path.abspath(
+            os.path.join(temp_dir, f"github_card_{hash_value}.png")
+        )
+
+        try:
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status == 200:
+                        with open(local_path, "wb") as f:
+                            f.write(await resp.read())
+                        logger.info(f"[github_cards] 成功下载图片至本地: {local_path}")
+                        return local_path
+                    else:
+                        logger.warning(
+                            f"[github_cards] 下载图片失败，HTTP 状态码: {resp.status}"
+                        )
+        except Exception as e:
+            logger.warning(f"[github_cards] 下载图片发生异常: {e}")
+
+        return url
+
     @filter.regex(GITHUB_URL_PATTERN)
     async def github_repo(self, event: AstrMessageEvent):
         """解析 Github 仓库信息"""
@@ -189,7 +215,8 @@ class MyPlugin(Star):
         logger.info(f"生成的 OpenGraph URL: {opengraph_url}")
 
         try:
-            yield event.image_result(opengraph_url)
+            local_path = await self._download_card_image(opengraph_url)
+            yield event.image_result(local_path)
         except Exception as e:
             logger.error(f"下载图片失败: {e}")
             yield event.plain_result("下载 GitHub 图片失败: " + str(e))
@@ -689,7 +716,8 @@ class MyPlugin(Star):
                     hash=hash_value, appendix=url_path
                 )
                 try:
-                    yield event.image_result(card_url)
+                    local_path = await self._download_card_image(card_url)
+                    yield event.image_result(local_path)
                 except Exception as e:
                     logger.error(f"下载 Issue 卡片图片失败: {e}")
 
@@ -727,7 +755,8 @@ class MyPlugin(Star):
                     hash=hash_value, appendix=url_path
                 )
                 try:
-                    yield event.image_result(card_url)
+                    local_path = await self._download_card_image(card_url)
+                    yield event.image_result(local_path)
                 except Exception as e:
                     logger.error(f"下载 PR 卡片图片失败: {e}")
 
