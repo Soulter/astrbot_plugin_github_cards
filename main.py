@@ -467,7 +467,7 @@ class MyPlugin(Star):
                 # 2. Fetch Commits
                 try:
                     params_commits = {
-                        "per_page": 10,
+                        "per_page": 100,
                         "since": last_check_dt.isoformat() + "Z",
                     }
                     async with session.get(
