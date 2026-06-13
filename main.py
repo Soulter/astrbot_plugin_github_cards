@@ -30,6 +30,8 @@ GITHUB_README_API_URL = (
     "https://api.github.com/repos/{repo}/readme"  # 新增 README API URL
 )
 GITHUB_ISSUES_API_URL = "https://api.github.com/repos/{repo}/issues"
+GITHUB_COMMITS_API_URL = "https://api.github.com/repos/{repo}/commits"
+GITHUB_RELEASES_API_URL = "https://api.github.com/repos/{repo}/releases"
 GITHUB_ISSUE_API_URL = "https://api.github.com/repos/{repo}/issues/{issue_number}"
 GITHUB_PR_API_URL = "https://api.github.com/repos/{repo}/pulls/{pr_number}"
 GITHUB_RATE_LIMIT_URL = "https://api.github.com/rate_limit"
@@ -409,7 +411,7 @@ class MyPlugin(Star):
                 logger.error(f"检查仓库 {repo} 更新时出错: {e}")
 
     async def _fetch_new_items(self, repo: str, last_check: str | None):
-        """Fetch new issues and PRs from a repository since last check"""
+        """Fetch new issues, PRs, commits, and releases from a repository since last check"""
         if not last_check:
             # If first time checking, just record current time and return empty list
             # Store as UTC timestamp without timezone info to avoid comparison issues
@@ -431,53 +433,99 @@ class MyPlugin(Star):
             logger.debug(f"仓库 {repo} 的上次检查时间: {last_check_dt.isoformat()}")
             new_items = []
 
-            # GitHub API returns both issues and PRs in the issues endpoint
             async with aiohttp.ClientSession() as session:
+                # 1. Fetch Issues / PRs
                 try:
-                    params = {
+                    params_issues = {
                         "sort": "created",
                         "direction": "desc",
                         "state": "all",
                         "per_page": 10,
+                        "since": last_check_dt.isoformat() + "Z",
                     }
                     async with session.get(
                         GITHUB_ISSUES_API_URL.format(repo=repo),
-                        params=params,
+                        params=params_issues,
                         headers=self._get_github_headers(),
                     ) as resp:
                         if resp.status == 200:
                             items = await resp.json()
-
                             for item in items:
-                                # Convert GitHub's timestamp to naive UTC datetime for consistent comparison
                                 github_timestamp = item["created_at"].replace("Z", "")
-                                created_at = datetime.fromisoformat(github_timestamp)
-
-                                # Always remove timezone info for comparison
-                                created_at = created_at.replace(tzinfo=None)
-
-                                logger.debug(
-                                    f"比较: 仓库 {repo} 的 item #{item['number']} 创建于 {created_at.isoformat()}, 上次检查: {last_check_dt.isoformat()}"
-                                )
-
+                                created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
                                 if created_at > last_check_dt:
-                                    logger.info(
-                                        f"发现新的 item #{item['number']} in {repo}"
-                                    )
+                                    logger.info(f"发现新的 item #{item.get('number')} in {repo}")
                                     new_items.append(item)
                                 else:
-                                    # Since items are sorted by creation time, we can break early
-                                    logger.debug(f"没有更多新 items in {repo}")
                                     break
                         else:
                             text = await resp.text()
-                            if len(text) > 100:
-                                text = text[:100] + "..."
-                            logger.error(
-                                f"获取仓库 {repo} 的 Issue/PR 失败: {resp.status}: {text}"
-                            )
+                            logger.error(f"获取仓库 {repo} 的 Issue/PR 失败: {resp.status}: {text[:100]}")
                 except Exception as e:
                     logger.error(f"获取仓库 {repo} 的 Issue/PR 时出错: {e}")
+
+                # 2. Fetch Commits
+                try:
+                    params_commits = {
+                        "per_page": 100,
+                        "since": last_check_dt.isoformat() + "Z",
+                    }
+                    async with session.get(
+                        GITHUB_COMMITS_API_URL.format(repo=repo),
+                        params=params_commits,
+                        headers=self._get_github_headers(),
+                    ) as resp:
+                        if resp.status == 200:
+                            commits = await resp.json()
+                            if isinstance(commits, list):
+                                for commit in commits:
+                                    commit_date_str = commit.get("commit", {}).get("committer", {}).get("date", "")
+                                    if not commit_date_str:
+                                        continue
+                                    github_timestamp = commit_date_str.replace("Z", "")
+                                    created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
+                                    if created_at > last_check_dt:
+                                        logger.info(f"发现新的 commit {commit.get('sha')[:7]} in {repo}")
+                                        commit["_astrbot_type"] = "commit"
+                                        # To pass branch info in notifier we can't easily get it here, but we can just say "代码推送"
+                                        new_items.append(commit)
+                                    else:
+                                        break
+                        else:
+                            text = await resp.text()
+                            logger.error(f"获取仓库 {repo} 的 Commits 失败: {resp.status}: {text[:100]}")
+                except Exception as e:
+                    logger.error(f"获取仓库 {repo} 的 Commits 时出错: {e}")
+
+                # 3. Fetch Releases
+                try:
+                    params_releases = {"per_page": 5}
+                    # releases API doesn't support 'since', we rely on sorting (default is by created_at desc)
+                    async with session.get(
+                        GITHUB_RELEASES_API_URL.format(repo=repo),
+                        params=params_releases,
+                        headers=self._get_github_headers(),
+                    ) as resp:
+                        if resp.status == 200:
+                            releases = await resp.json()
+                            if isinstance(releases, list):
+                                for release in releases:
+                                    release_date_str = release.get("published_at") or release.get("created_at") or ""
+                                    if not release_date_str:
+                                        continue
+                                    github_timestamp = release_date_str.replace("Z", "")
+                                    created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
+                                    if created_at > last_check_dt:
+                                        logger.info(f"发现新的 release {release.get('tag_name')} in {repo}")
+                                        release["_astrbot_type"] = "release"
+                                        new_items.append(release)
+                                    else:
+                                        break
+                        else:
+                            text = await resp.text()
+                            logger.error(f"获取仓库 {repo} 的 Releases 失败: {resp.status}: {text[:100]}")
+                except Exception as e:
+                    logger.error(f"获取仓库 {repo} 的 Releases 时出错: {e}")
 
             # Update the last check time to now (UTC without timezone info)
             if new_items:
@@ -493,9 +541,7 @@ class MyPlugin(Star):
 
             return new_items
         except Exception as e:
-            logger.error(f"解析时间时出错: {e}")
-            # If we can't parse the time correctly, just return an empty list
-            # and update the last check time to prevent continuous errors
+            logger.error(f"解析时间/获取数据时出错: {e}", exc_info=True)
             self.last_check_time[repo] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
@@ -515,13 +561,40 @@ class MyPlugin(Star):
             try:
                 # Create notification message
                 for item in new_items:
-                    item_type = "PR" if "pull_request" in item else "Issue"
-                    message = (
-                        f"[GitHub 更新] 仓库 {repo} 有新的{item_type}:\n"
-                        f"#{item['number']} {item['title']}\n"
-                        f"作者: {item['user']['login']}\n"
-                        f"链接: {item['html_url']}"
-                    )
+                    if "_astrbot_type" in item:
+                        if item["_astrbot_type"] == "commit":
+                            sha = item.get("sha", "")[:7]
+                            msg = item.get("commit", {}).get("message", "").split("\n")[0]
+                            author = item.get("commit", {}).get("author", {}).get("name", "未知")
+                            url = item.get("html_url", "")
+                            message = (
+                                f"[GitHub 更新] 仓库 {repo} 有新的代码推送:\n"
+                                f"- {sha} {msg}\n"
+                                f"作者: {author}\n"
+                                f"链接: {url}"
+                            )
+                        elif item["_astrbot_type"] == "release":
+                            tag_name = item.get("tag_name", "未知版本")
+                            name = item.get("name") or tag_name
+                            author = item.get("author", {}).get("login", "未知")
+                            url = item.get("html_url", "")
+                            message = (
+                                f"[GitHub 更新] 仓库 {repo} 发布了新版本:\n"
+                                f"版本: {name} ({tag_name})\n"
+                                f"发布者: {author}\n"
+                                f"链接: {url}"
+                            )
+                        else:
+                            # Fallback if unknown type
+                            continue
+                    else:
+                        item_type = "PR" if "pull_request" in item else "Issue"
+                        message = (
+                            f"[GitHub 更新] 仓库 {repo} 有新的{item_type}:\n"
+                            f"#{item['number']} {item['title']}\n"
+                            f"作者: {item['user']['login']}\n"
+                            f"链接: {item['html_url']}"
+                        )
 
                     # Send message to subscriber
                     await self.context.send_message(
@@ -640,6 +713,16 @@ class MyPlugin(Star):
             message = formatters.format_webhook_create_message(
                 repo_full_name, payload, sender
             )
+        elif event_type == "push":
+            message = formatters.format_webhook_push_message(
+                repo_full_name, payload, sender
+            )
+        elif event_type == "release":
+            release = payload.get("release")
+            if isinstance(release, dict):
+                message = formatters.format_webhook_release_message(
+                    repo_full_name, action, release, sender
+                )
         else:
             logger.debug(f"暂不处理的 GitHub Webhook 事件类型: {event_type}")
             return
