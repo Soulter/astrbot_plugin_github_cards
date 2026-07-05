@@ -46,10 +46,9 @@ LINK_SETTINGS_FILE = "data/github_link_settings.json"
 
 @register(
     "astrbot_plugin_github_cards",
-    "Soulter",
     "根据群聊中 GitHub 相关链接自动发送 GitHub OpenGraph 图片，支持订阅仓库的 Issue 和 PR",
     "1.1.0",
-    "https://github.com/Soulter/astrbot_plugin_github_cards",
+    "https://github.com AstrBotDev/astrbot_plugin_github_cards",
 )
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -214,7 +213,7 @@ class MyPlugin(Star):
 
     @filter.command("ghsub")
     async def subscribe_repo(self, event: AstrMessageEvent, repo: str):
-        """订阅 GitHub 仓库的 Issue 和 PR。例如: /ghsub Soulter/AstrBot"""
+        """订阅 GitHub 仓库的 Issue 和 PR。例如: /ghsub AstrBotDev/AstrBot"""
         if not self._is_valid_repo(repo):
             yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
             return
@@ -266,7 +265,7 @@ class MyPlugin(Star):
 
     @filter.command("ghunsub")
     async def unsubscribe_repo(self, event: AstrMessageEvent, repo: str | None = None):
-        """取消订阅 GitHub 仓库。例如: /ghunsub Soulter/AstrBot，不提供仓库名则取消所有订阅"""
+        """取消订阅 GitHub 仓库。例如: /ghunsub AstrBotDev/AstrBot，不提供仓库名则取消所有订阅"""
         subscriber_id = event.unified_msg_origin
 
         if repo is None:
@@ -322,7 +321,7 @@ class MyPlugin(Star):
 
     @filter.command("ghdefault", alias={"ghdef"})
     async def set_default_repo(self, event: AstrMessageEvent, repo: str | None = None):
-        """设置默认仓库。例如: /ghdefault Soulter/AstrBot"""
+        """设置默认仓库。例如: /ghdefault AstrBotDev/AstrBot"""
         if repo is None:
             # Show current default repo
             default_repo = self.default_repos.get(event.unified_msg_origin)
@@ -359,7 +358,6 @@ class MyPlugin(Star):
         self.default_repos[event.unified_msg_origin] = display_name
         self._save_default_repos()
         yield event.plain_result(f"已将 {display_name} 设为默认仓库")
-
     def _is_valid_repo(self, repo: str) -> bool:
         """Check if the repository name is valid"""
         return bool(re.match(r"[\w\-]+/[\w\-]+$", repo))
@@ -1035,7 +1033,7 @@ class MyPlugin(Star):
     # TODO: svg2png
     # @filter.command("ghstar")
     # async def ghstar(self, event: AstrMessageEvent, identifier: str):
-    #     '''查看 GitHub 仓库的 Star 趋势图。如: /ghstar Soulter/AstrBot'''
+    #     '''查看 GitHub 仓库的 Star 趋势图。如: /ghstar AstrBotDev/AstrBot'''
     #     url = STAR_HISTORY_URL.format(identifier=identifier)
     #     # download svg
     #     fpath = "data/temp/{identifier}.svg".format(identifier=identifier.replace("/",
