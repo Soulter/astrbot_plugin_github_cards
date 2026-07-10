@@ -36,6 +36,37 @@ GITHUB_ISSUE_API_URL = "https://api.github.com/repos/{repo}/issues/{issue_number
 GITHUB_PR_API_URL = "https://api.github.com/repos/{repo}/pulls/{pr_number}"
 GITHUB_RATE_LIMIT_URL = "https://api.github.com/rate_limit"
 
+POLL_EVENTS = {"issues", "prs", "commits", "releases"}
+WEBHOOK_EVENTS = {
+    "issues",
+    "issue_comment",
+    "prs",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_review_thread",
+    "commit_comment",
+    "discussion",
+    "discussion_comment",
+    "fork",
+    "star",
+    "create",
+    "push",
+    "commits",
+    "release",
+    "releases",
+}
+SUBSCRIPTION_EVENTS = POLL_EVENTS | WEBHOOK_EVENTS
+EVENT_ALIASES = {
+    "issue": "issues",
+    "pr": "prs",
+    "pulls": "prs",
+    "pull_request": "prs",
+    "commit": "commits",
+    "push": "commits",
+    "release": "releases",
+}
+
 # Path for storing subscription data
 SUBSCRIPTION_FILE = "data/github_subscriptions.json"
 # Path for storing default repo data
@@ -212,38 +243,49 @@ class MyPlugin(Star):
         yield event.plain_result(f"已在当前会话{status_text} GitHub 链接自动解析")
 
     @filter.command("ghsub")
-    async def subscribe_repo(self, event: AstrMessageEvent, repo: str):
-        """订阅 GitHub 仓库的 Issue 和 PR。例如: /ghsub AstrBotDev/AstrBot"""
-        if not self._is_valid_repo(repo):
-            yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
+    async def subscribe_repo(
+        self,
+        event: AstrMessageEvent,
+        repo: str,
+        branch: str | None = None,
+        events: str | None = None,
+    ):
+        """订阅 GitHub 仓库事件。例如: /ghsub AstrBotDev/AstrBot main issues,commits"""
+        parsed = self._parse_subscribe_target(repo, branch, events)
+        if not parsed:
+            yield event.plain_result(
+                "请提供有效的仓库名，格式为: 用户名/仓库名 或 用户名/仓库名 分支名"
+            )
             return
 
-        # Normalize repository name
-        normalized_repo = self._normalize_repo_name(repo)
+        base_repo, branch, event_set = parsed
 
         # Check if the repo exists
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    GITHUB_API_URL.format(repo=repo), headers=self._get_github_headers()
+                    GITHUB_API_URL.format(repo=base_repo),
+                    headers=self._get_github_headers(),
                 ) as resp:
                     if resp.status != 200:
-                        yield event.plain_result(f"仓库 {repo} 不存在或无法访问")
+                        yield event.plain_result(f"仓库 {base_repo} 不存在或无法访问")
                         return
 
                     repo_data = await resp.json()
-                    display_name = repo_data.get("full_name", repo)
+                    display_name = repo_data.get("full_name", base_repo)
         except Exception as e:
             logger.error(f"访问 GitHub API 失败: {e}")
             yield event.plain_result(f"检查仓库时出错: {str(e)}")
             return
 
+        # Build the subscription key including optional branch/events
+        repo_key = self._format_repo_key(base_repo, branch, event_set)
+        display_suffix = f" ({branch} 分支)" if branch else ""
+        if event_set:
+            display_suffix += f" [{', '.join(sorted(event_set))}]"
+
         # Get the unique identifier for the subscriber
         subscriber_id = event.unified_msg_origin
-
-        repo_key = self._resolve_repo_key(repo)
-        if not repo_key:
-            repo_key = normalized_repo if self.use_lowercase else display_name
 
         subscribers = self.subscriptions.setdefault(repo_key, [])
 
@@ -251,20 +293,34 @@ class MyPlugin(Star):
             subscribers.append(subscriber_id)
             self._save_subscriptions()
 
-            # Fetch initial state for new subscription
+            # Fetch initial state for new subscription.
+            # Repo-level polling uses base_repo as timestamp key to avoid duplicate API calls.
             if not self.enable_webhook:
-                await self._fetch_new_items(repo_key, None)
+                if self._subscription_allows(repo_key, "issues") or self._subscription_allows(repo_key, "prs") or self._subscription_allows(repo_key, "releases"):
+                    await self._fetch_new_items(base_repo, None, fetch_commits=False)
+                if self._subscription_allows(repo_key, "commits"):
+                    await self._fetch_new_items(repo_key, None, fetch_repo_level=False)
 
-            yield event.plain_result(f"成功订阅仓库 {display_name} 的事件更新。")
+            yield event.plain_result(
+                f"成功订阅仓库 {display_name}{display_suffix} 的事件更新。"
+            )
         else:
-            yield event.plain_result(f"你已经订阅了仓库 {display_name}")
+            yield event.plain_result(
+                f"你已经订阅了仓库 {display_name}{display_suffix}"
+            )
 
-        # Set as default repo for this conversation
+        # Set as default repo for this conversation (always store base repo)
         self.default_repos[event.unified_msg_origin] = display_name
         self._save_default_repos()
 
     @filter.command("ghunsub")
-    async def unsubscribe_repo(self, event: AstrMessageEvent, repo: str | None = None):
+    async def unsubscribe_repo(
+        self,
+        event: AstrMessageEvent,
+        repo: str | None = None,
+        branch: str | None = None,
+        events: str | None = None,
+    ):
         """取消订阅 GitHub 仓库。例如: /ghunsub AstrBotDev/AstrBot，不提供仓库名则取消所有订阅"""
         subscriber_id = event.unified_msg_origin
 
@@ -287,20 +343,28 @@ class MyPlugin(Star):
                 yield event.plain_result("你没有订阅任何仓库")
             return
 
-        if not self._is_valid_repo(repo):
-            yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
+        parsed = self._parse_subscribe_target(repo, branch, events)
+        if not parsed:
+            yield event.plain_result(
+                "请提供有效的仓库名，格式为: 用户名/仓库名 或 用户名/仓库名 分支名"
+            )
             return
 
-        repo_key = self._resolve_repo_key(repo)
+        base_repo, branch, event_set = parsed
+        repo_key = self._format_repo_key(base_repo, branch, event_set)
+        display_suffix = f" ({branch} 分支)" if branch else ""
+        if event_set:
+            display_suffix += f" [{', '.join(sorted(event_set))}]"
+
         if repo_key and subscriber_id in self.subscriptions.get(repo_key, []):
             self.subscriptions[repo_key].remove(subscriber_id)
             if not self.subscriptions[repo_key]:
                 del self.subscriptions[repo_key]
             self._save_subscriptions()
             self.last_check_time.pop(repo_key, None)
-            yield event.plain_result(f"已取消订阅仓库 {repo_key}")
+            yield event.plain_result(f"已取消订阅仓库 {repo_key}{display_suffix}")
         else:
-            yield event.plain_result(f"你没有订阅仓库 {repo}")
+            yield event.plain_result(f"你没有订阅仓库 {base_repo}{display_suffix}")
 
     @filter.command("ghlist")
     async def list_subscriptions(self, event: AstrMessageEvent):
@@ -359,8 +423,118 @@ class MyPlugin(Star):
         self._save_default_repos()
         yield event.plain_result(f"已将 {display_name} 设为默认仓库")
     def _is_valid_repo(self, repo: str) -> bool:
-        """Check if the repository name is valid"""
-        return bool(re.match(r"[\w\-]+/[\w\-]+$", repo))
+        """Check if the repository name is valid (user/repo format)"""
+        return bool(re.match(r"^[\w\-]+/[\w\-]+$", repo))
+
+    def _parse_event_list(self, events: str | None) -> set[str] | None:
+        """Parse comma-separated event list. None means all events."""
+        if not events:
+            return None
+        parsed = {
+            EVENT_ALIASES.get(item.strip().lower(), item.strip().lower())
+            for item in events.split(",")
+            if item.strip()
+        }
+        if not parsed or not parsed <= SUBSCRIPTION_EVENTS:
+            return None
+        return parsed
+
+    def _events_to_suffix(self, events: set[str] | None) -> str:
+        return "" if events is None else ":" + ",".join(sorted(events))
+
+    def _parse_repo_key(self, repo_key: str) -> tuple[str, str | None]:
+        """Parse subscription key into (base_repo, branch), ignoring event suffix."""
+        key_without_events = repo_key.split(":", 1)[0]
+        parts = key_without_events.split("/")
+        if len(parts) == 2:
+            return key_without_events, None
+        if len(parts) >= 3:
+            return f"{parts[0]}/{parts[1]}", "/".join(parts[2:])
+        return key_without_events, None
+
+    def _parse_subscription_key(
+        self, repo_key: str
+    ) -> tuple[str, str | None, set[str] | None]:
+        """Parse subscription key into (base_repo, branch, events)."""
+        key, _, events_part = repo_key.partition(":")
+        base_repo, branch = self._parse_repo_key(key)
+        events = self._parse_event_list(events_part) if events_part else None
+        return base_repo, branch, events
+
+    def _format_repo_key(
+        self,
+        base_repo: str,
+        branch: str | None = None,
+        events: set[str] | None = None,
+    ) -> str:
+        """Format base_repo, optional branch and optional events into key."""
+        normalized_base = self._normalize_repo_name(base_repo)
+        if branch:
+            branch_norm = branch.lower() if self.use_lowercase else branch
+            return f"{normalized_base}/{branch_norm}{self._events_to_suffix(events)}"
+        return f"{normalized_base}{self._events_to_suffix(events)}"
+
+    def _parse_subscribe_target(
+        self,
+        repo: str | None,
+        branch: str | None = None,
+        events: str | None = None,
+    ) -> tuple[str, str | None, set[str] | None] | None:
+        """Parse command args into (base_repo, branch, events).
+
+        Supported:
+        - /ghsub user/repo
+        - /ghsub user/repo main
+        - /ghsub user/repo issues
+        - /ghsub user/repo main issues,commits
+        - /ghsub user/repo/main issues,commits
+        """
+        if not repo:
+            return None
+
+        branch_value = branch
+        events_value = events
+        if branch_value and events_value is None:
+            maybe_events = self._parse_event_list(branch_value)
+            if maybe_events is not None:
+                branch_value = None
+                events_value = branch
+
+        parsed_events = self._parse_event_list(events_value) if events_value else None
+        if events_value and parsed_events is None:
+            return None
+
+        parts = repo.split("/", 2)
+        if len(parts) == 2 and self._is_valid_repo(repo):
+            return repo, branch_value, parsed_events
+        if len(parts) >= 3:
+            if branch_value is not None:
+                return None
+            return f"{parts[0]}/{parts[1]}", parts[2], parsed_events
+
+        return None
+
+    def _subscription_allows(self, repo_key: str, event_name: str) -> bool:
+        """Return whether a subscription key allows an event."""
+        _, _, events = self._parse_subscription_key(repo_key)
+        event_name = EVENT_ALIASES.get(event_name, event_name)
+        return events is None or event_name in events
+
+    def _item_event_name(self, item: dict[str, Any]) -> str:
+        if item.get("_astrbot_type") == "commit":
+            return "commits"
+        if item.get("_astrbot_type") == "release":
+            return "releases"
+        return "prs" if "pull_request" in item else "issues"
+
+    def _webhook_event_name(self, event_type: str) -> str:
+        return EVENT_ALIASES.get(event_type, event_type)
+
+    def _extract_webhook_branch(self, event_type: str, payload: dict[str, Any]) -> str | None:
+        ref = payload.get("ref")
+        if isinstance(ref, str) and ref.startswith("refs/heads/"):
+            return ref.removeprefix("refs/heads/")
+        return None
 
     async def _check_updates_periodically(self):
         """Periodically check for updates in subscribed repositories"""
@@ -383,159 +557,201 @@ class MyPlugin(Star):
             logger.info("停止检查仓库更新")
 
     async def _check_all_repos(self):
-        """Check all subscribed repositories for updates"""
+        """Check all subscribed repositories for updates.
+
+        Repository-level items (issues/PRs/releases) are checked once per base
+        repository, while commits are checked per branch subscription to avoid
+        duplicate notifications.
+        """
         if self.enable_webhook:
             return
 
-        for repo in list(self.subscriptions.keys()):
-            logger.debug(f"正在检查仓库 {repo} 更新")
-            if not self.subscriptions[repo]:  # Skip if no subscribers
+        # Group subscription keys by base repository
+        base_to_keys: dict[str, list[str]] = {}
+        for repo_key in list(self.subscriptions.keys()):
+            if not self.subscriptions[repo_key]:
                 continue
+            base_repo, _, _ = self._parse_subscription_key(repo_key)
+            base_to_keys.setdefault(base_repo, []).append(repo_key)
+
+        for base_repo, repo_keys in base_to_keys.items():
+            logger.debug(f"正在检查仓库 {base_repo} 更新")
 
             try:
-                # Get the last check time for this repo
-                last_check = self.last_check_time.get(repo, None)
+                need_repo_level = any(
+                    self._subscription_allows(k, "issues")
+                    or self._subscription_allows(k, "prs")
+                    or self._subscription_allows(k, "releases")
+                    for k in repo_keys
+                )
+                if need_repo_level:
+                    # Repo-level events use one timestamp per base repository to avoid duplicate API calls.
+                    last_check = self.last_check_time.get(base_repo, None)
+                    repo_items = await self._fetch_new_items(
+                        base_repo, last_check, fetch_commits=False
+                    )
+                    if repo_items:
+                        self.last_check_time[base_repo] = datetime.now().isoformat()
+                        for repo_key in repo_keys:
+                            await self._notify_subscribers(repo_key, repo_items)
 
-                # Fetch new issues and PRs
-                new_items = await self._fetch_new_items(repo, last_check)
-
-                if new_items:
-                    # Update last check time
-                    self.last_check_time[repo] = datetime.now().isoformat()
-
-                    # Notify subscribers about new items
-                    await self._notify_subscribers(repo, new_items)
+                # Check commits individually for each branch subscription that allows commits
+                for repo_key in repo_keys:
+                    if not self._subscription_allows(repo_key, "commits"):
+                        continue
+                    last_check = self.last_check_time.get(repo_key, None)
+                    branch_items = await self._fetch_new_items(
+                        repo_key, last_check, fetch_repo_level=False
+                    )
+                    if branch_items:
+                        self.last_check_time[repo_key] = datetime.now().isoformat()
+                        await self._notify_subscribers(repo_key, branch_items)
             except Exception as e:
-                logger.error(f"检查仓库 {repo} 更新时出错: {e}")
+                logger.error(f"检查仓库 {base_repo} 更新时出错: {e}")
 
-    async def _fetch_new_items(self, repo: str, last_check: str | None):
-        """Fetch new issues, PRs, commits, and releases from a repository since last check"""
+    async def _fetch_new_items(
+        self,
+        repo: str,
+        last_check: str | None,
+        *,
+        fetch_repo_level: bool = True,
+        fetch_commits: bool = True,
+    ):
+        """Fetch new issues, PRs, commits, and releases from a repository since last check.
+
+        The ``repo`` argument may include an optional branch suffix, e.g.
+        ``user/repo`` or ``user/repo/main``. When a branch is specified,
+        only commits on that branch are monitored.
+
+        ``fetch_repo_level`` controls whether issues/PRs/releases are checked
+        (these are repository-level). ``fetch_commits`` controls whether
+        commits are checked (branch-scoped when a branch is present).
+        """
+        base_repo, branch = self._parse_repo_key(repo)
+        branch_suffix = f" ({branch} 分支)" if branch else ""
+
         if not last_check:
-            # If first time checking, just record current time and return empty list
-            # Store as UTC timestamp without timezone info to avoid comparison issues
             self.last_check_time[repo] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
-            logger.info(f"初始化仓库 {repo} 的时间戳: {self.last_check_time[repo]}")
+            logger.info(f"初始化仓库 {repo}{branch_suffix} 的时间戳: {self.last_check_time[repo]}")
             return []
 
         try:
-            # Always treat stored timestamps as UTC without timezone info
             last_check_dt = datetime.fromisoformat(last_check)
-
-            # Ensure it's treated as naive datetime
             if hasattr(last_check_dt, "tzinfo") and last_check_dt.tzinfo is not None:
-                # If it somehow has timezone info, convert to naive UTC
                 last_check_dt = last_check_dt.replace(tzinfo=None)
 
-            logger.debug(f"仓库 {repo} 的上次检查时间: {last_check_dt.isoformat()}")
+            logger.debug(f"仓库 {repo}{branch_suffix} 的上次检查时间: {last_check_dt.isoformat()}")
             new_items = []
 
             async with aiohttp.ClientSession() as session:
-                # 1. Fetch Issues / PRs
-                try:
-                    params_issues = {
-                        "sort": "created",
-                        "direction": "desc",
-                        "state": "all",
-                        "per_page": 10,
-                        "since": last_check_dt.isoformat() + "Z",
-                    }
-                    async with session.get(
-                        GITHUB_ISSUES_API_URL.format(repo=repo),
-                        params=params_issues,
-                        headers=self._get_github_headers(),
-                    ) as resp:
-                        if resp.status == 200:
-                            items = await resp.json()
-                            for item in items:
-                                github_timestamp = item["created_at"].replace("Z", "")
-                                created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
-                                if created_at > last_check_dt:
-                                    logger.info(f"发现新的 item #{item.get('number')} in {repo}")
-                                    new_items.append(item)
-                                else:
-                                    break
-                        else:
-                            text = await resp.text()
-                            logger.error(f"获取仓库 {repo} 的 Issue/PR 失败: {resp.status}: {text[:100]}")
-                except Exception as e:
-                    logger.error(f"获取仓库 {repo} 的 Issue/PR 时出错: {e}")
-
-                # 2. Fetch Commits
-                try:
-                    params_commits = {
-                        "per_page": 100,
-                        "since": last_check_dt.isoformat() + "Z",
-                    }
-                    async with session.get(
-                        GITHUB_COMMITS_API_URL.format(repo=repo),
-                        params=params_commits,
-                        headers=self._get_github_headers(),
-                    ) as resp:
-                        if resp.status == 200:
-                            commits = await resp.json()
-                            if isinstance(commits, list):
-                                for commit in commits:
-                                    commit_date_str = commit.get("commit", {}).get("committer", {}).get("date", "")
-                                    if not commit_date_str:
-                                        continue
-                                    github_timestamp = commit_date_str.replace("Z", "")
+                if fetch_repo_level:
+                    # 1. Fetch Issues / PRs (repository-level)
+                    try:
+                        params_issues = {
+                            "sort": "created",
+                            "direction": "desc",
+                            "state": "all",
+                            "per_page": 10,
+                            "since": last_check_dt.isoformat() + "Z",
+                        }
+                        async with session.get(
+                            GITHUB_ISSUES_API_URL.format(repo=base_repo),
+                            params=params_issues,
+                            headers=self._get_github_headers(),
+                        ) as resp:
+                            if resp.status == 200:
+                                items = await resp.json()
+                                for item in items:
+                                    github_timestamp = item["created_at"].replace("Z", "")
                                     created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
                                     if created_at > last_check_dt:
-                                        logger.info(f"发现新的 commit {commit.get('sha')[:7]} in {repo}")
-                                        commit["_astrbot_type"] = "commit"
-                                        # To pass branch info in notifier we can't easily get it here, but we can just say "代码推送"
-                                        new_items.append(commit)
+                                        logger.info(f"发现新的 item #{item.get('number')} in {base_repo}")
+                                        new_items.append(item)
                                     else:
                                         break
-                        else:
-                            text = await resp.text()
-                            logger.error(f"获取仓库 {repo} 的 Commits 失败: {resp.status}: {text[:100]}")
-                except Exception as e:
-                    logger.error(f"获取仓库 {repo} 的 Commits 时出错: {e}")
+                            else:
+                                text = await resp.text()
+                                logger.error(f"获取仓库 {base_repo} 的 Issue/PR 失败: {resp.status}: {text[:100]}")
+                    except Exception as e:
+                        logger.error(f"获取仓库 {base_repo} 的 Issue/PR 时出错: {e}")
 
-                # 3. Fetch Releases
-                try:
-                    params_releases = {"per_page": 5}
-                    # releases API doesn't support 'since', we rely on sorting (default is by created_at desc)
-                    async with session.get(
-                        GITHUB_RELEASES_API_URL.format(repo=repo),
-                        params=params_releases,
-                        headers=self._get_github_headers(),
-                    ) as resp:
-                        if resp.status == 200:
-                            releases = await resp.json()
-                            if isinstance(releases, list):
-                                for release in releases:
-                                    release_date_str = release.get("published_at") or release.get("created_at") or ""
-                                    if not release_date_str:
-                                        continue
-                                    github_timestamp = release_date_str.replace("Z", "")
-                                    created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
-                                    if created_at > last_check_dt:
-                                        logger.info(f"发现新的 release {release.get('tag_name')} in {repo}")
-                                        release["_astrbot_type"] = "release"
-                                        new_items.append(release)
-                                    else:
-                                        break
-                        else:
-                            text = await resp.text()
-                            logger.error(f"获取仓库 {repo} 的 Releases 失败: {resp.status}: {text[:100]}")
-                except Exception as e:
-                    logger.error(f"获取仓库 {repo} 的 Releases 时出错: {e}")
+                if fetch_commits:
+                    # 2. Fetch Commits (optionally scoped to a branch)
+                    try:
+                        params_commits: dict[str, Any] = {
+                            "per_page": 100,
+                            "since": last_check_dt.isoformat() + "Z",
+                        }
+                        if branch:
+                            params_commits["sha"] = branch
+                        async with session.get(
+                            GITHUB_COMMITS_API_URL.format(repo=base_repo),
+                            params=params_commits,
+                            headers=self._get_github_headers(),
+                        ) as resp:
+                            if resp.status == 200:
+                                commits = await resp.json()
+                                if isinstance(commits, list):
+                                    for commit in commits:
+                                        commit_date_str = commit.get("commit", {}).get("committer", {}).get("date", "")
+                                        if not commit_date_str:
+                                            continue
+                                        github_timestamp = commit_date_str.replace("Z", "")
+                                        created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
+                                        if created_at > last_check_dt:
+                                            logger.info(f"发现新的 commit {commit.get('sha')[:7]} in {repo}{branch_suffix}")
+                                            commit["_astrbot_type"] = "commit"
+                                            commit["_astrbot_branch"] = branch
+                                            new_items.append(commit)
+                                        else:
+                                            break
+                            else:
+                                text = await resp.text()
+                                logger.error(f"获取仓库 {repo}{branch_suffix} 的 Commits 失败: {resp.status}: {text[:100]}")
+                    except Exception as e:
+                        logger.error(f"获取仓库 {repo}{branch_suffix} 的 Commits 时出错: {e}")
 
-            # Update the last check time to now (UTC without timezone info)
+                if fetch_repo_level:
+                    # 3. Fetch Releases (repository-level)
+                    try:
+                        params_releases = {"per_page": 5}
+                        async with session.get(
+                            GITHUB_RELEASES_API_URL.format(repo=base_repo),
+                            params=params_releases,
+                            headers=self._get_github_headers(),
+                        ) as resp:
+                            if resp.status == 200:
+                                releases = await resp.json()
+                                if isinstance(releases, list):
+                                    for release in releases:
+                                        release_date_str = release.get("published_at") or release.get("created_at") or ""
+                                        if not release_date_str:
+                                            continue
+                                        github_timestamp = release_date_str.replace("Z", "")
+                                        created_at = datetime.fromisoformat(github_timestamp).replace(tzinfo=None)
+                                        if created_at > last_check_dt:
+                                            logger.info(f"发现新的 release {release.get('tag_name')} in {base_repo}")
+                                            release["_astrbot_type"] = "release"
+                                            new_items.append(release)
+                                        else:
+                                            break
+                            else:
+                                text = await resp.text()
+                                logger.error(f"获取仓库 {base_repo} 的 Releases 失败: {resp.status}: {text[:100]}")
+                    except Exception as e:
+                        logger.error(f"获取仓库 {base_repo} 的 Releases 时出错: {e}")
+
             if new_items:
-                logger.info(f"找到 {len(new_items)} 个新的 items 在 {repo}")
+                logger.info(f"找到 {len(new_items)} 个新的 items 在 {repo}{branch_suffix}")
             else:
-                logger.debug(f"没有找到新的 items 在 {repo}")
+                logger.debug(f"没有找到新的 items 在 {repo}{branch_suffix}")
 
-            # Always update the timestamp after checking, regardless of whether we found items
             self.last_check_time[repo] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
-            logger.debug(f"更新仓库 {repo} 的时间戳为: {self.last_check_time[repo]}")
+            logger.debug(f"更新仓库 {repo}{branch_suffix} 的时间戳为: {self.last_check_time[repo]}")
 
             return new_items
         except Exception as e:
@@ -544,7 +760,7 @@ class MyPlugin(Star):
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
             logger.info(
-                f"出错后更新仓库 {repo} 的时间戳为: {self.last_check_time[repo]}"
+                f"出错后更新仓库 {repo}{branch_suffix} 的时间戳为: {self.last_check_time[repo]}"
             )
             return []
 
@@ -554,19 +770,25 @@ class MyPlugin(Star):
             return
 
         repo_key = self._resolve_repo_key(repo) or repo
+        base_repo, branch, _ = self._parse_subscription_key(repo_key)
+        branch_suffix = f" ({branch} 分支)" if branch else ""
 
         for subscriber_id in self.subscriptions.get(repo_key, []):
             try:
                 # Create notification message
                 for item in new_items:
+                    if not self._subscription_allows(repo_key, self._item_event_name(item)):
+                        continue
                     if "_astrbot_type" in item:
                         if item["_astrbot_type"] == "commit":
                             sha = item.get("sha", "")[:7]
                             msg = item.get("commit", {}).get("message", "").split("\n")[0]
                             author = item.get("commit", {}).get("author", {}).get("name", "未知")
                             url = item.get("html_url", "")
+                            branch = item.get("_astrbot_branch")
+                            branch_info = f" ({branch} 分支)" if branch else ""
                             message = (
-                                f"[GitHub 更新] 仓库 {repo} 有新的代码推送:\n"
+                                f"[GitHub 更新] 仓库 {base_repo}{branch_info} 有新的代码推送:\n"
                                 f"- {sha} {msg}\n"
                                 f"作者: {author}\n"
                                 f"链接: {url}"
@@ -577,7 +799,7 @@ class MyPlugin(Star):
                             author = item.get("author", {}).get("login", "未知")
                             url = item.get("html_url", "")
                             message = (
-                                f"[GitHub 更新] 仓库 {repo} 发布了新版本:\n"
+                                f"[GitHub 更新] 仓库 {base_repo}{branch_suffix} 发布了新版本:\n"
                                 f"版本: {name} ({tag_name})\n"
                                 f"发布者: {author}\n"
                                 f"链接: {url}"
@@ -588,7 +810,7 @@ class MyPlugin(Star):
                     else:
                         item_type = "PR" if "pull_request" in item else "Issue"
                         message = (
-                            f"[GitHub 更新] 仓库 {repo} 有新的{item_type}:\n"
+                            f"[GitHub 更新] 仓库 {base_repo}{branch_suffix} 有新的{item_type}:\n"
                             f"#{item['number']} {item['title']}\n"
                             f"作者: {item['user']['login']}\n"
                             f"链接: {item['html_url']}"
@@ -622,17 +844,26 @@ class MyPlugin(Star):
             logger.warning("GitHub Webhook 事件缺少仓库全名")
             return
 
-        repo_key = self._resolve_repo_key(repo_full_name)
-        if not repo_key:
-            logger.debug(
-                f"忽略仓库 {repo_full_name} 的 Webhook 事件 {event_type}: 未找到对应订阅"
-            )
-            return
+        event_name = self._webhook_event_name(event_type)
+        event_branch = self._extract_webhook_branch(event_type, payload)
+        normalized_repo = self._normalize_repo_name(repo_full_name)
+        matching_keys = []
+        for key, subscribers in self.subscriptions.items():
+            if not subscribers:
+                continue
+            base_repo, branch, _ = self._parse_subscription_key(key)
+            if self._normalize_repo_name(base_repo) != normalized_repo:
+                continue
+            if branch and event_branch and self._normalize_repo_name(branch) != self._normalize_repo_name(event_branch):
+                continue
+            if branch and event_branch is None and event_type in {"push", "create"}:
+                continue
+            if self._subscription_allows(key, event_name):
+                matching_keys.append(key)
 
-        subscribers = self.subscriptions.get(repo_key, [])
-        if not subscribers:
+        if not matching_keys:
             logger.debug(
-                f"仓库 {repo_full_name} 没有订阅者，跳过 Webhook 事件 {event_type}"
+                f"忽略仓库 {repo_full_name} 的 Webhook 事件 {event_type}: 未找到匹配订阅"
             )
             return
 
@@ -729,14 +960,19 @@ class MyPlugin(Star):
             logger.debug(f"Webhook 事件 {event_type} 未生成通知，可能是不支持的 action")
             return
 
-        for subscriber_id in subscribers:
-            try:
-                await self.context.send_message(
-                    subscriber_id, MessageChain(chain=[Comp.Plain(message)])
-                )
-                await asyncio.sleep(1)
-            except Exception as exc:
-                logger.error(f"向订阅者 {subscriber_id} 发送 Webhook 通知时出错: {exc}")
+        sent_to: set[str] = set()
+        for repo_key in matching_keys:
+            for subscriber_id in self.subscriptions.get(repo_key, []):
+                if subscriber_id in sent_to:
+                    continue
+                sent_to.add(subscriber_id)
+                try:
+                    await self.context.send_message(
+                        subscriber_id, MessageChain(chain=[Comp.Plain(message)])
+                    )
+                    await asyncio.sleep(1)
+                except Exception as exc:
+                    logger.error(f"向订阅者 {subscriber_id} 发送 Webhook 通知时出错: {exc}")
 
     @filter.command("ghissue", alias={"ghis"})
     async def get_issue_details(self, event: AstrMessageEvent, issue_ref: str):
