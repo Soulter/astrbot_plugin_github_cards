@@ -7,14 +7,11 @@ import sys
 import uuid
 from datetime import datetime
 from typing import Any
-
 import aiohttp
-
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-
 from . import formatters
 from .webhook_server import GitHubWebhookServer
 
@@ -26,9 +23,7 @@ GITHUB_URL_PATTERN = r"https://github\.com/[\w\-]+/[\w\-]+(?:/(pull|issues)/\d+)
 GITHUB_REPO_OPENGRAPH = "https://opengraph.githubassets.com/{hash}/{appendix}"
 STAR_HISTORY_URL = "https://api.star-history.com/svg?repos={identifier}&type=Date"
 GITHUB_API_URL = "https://api.github.com/repos/{repo}"
-GITHUB_README_API_URL = (
-    "https://api.github.com/repos/{repo}/readme"  # 新增 README API URL
-)
+GITHUB_README_API_URL = "https://api.github.com/repos/{repo}/readme"
 GITHUB_ISSUES_API_URL = "https://api.github.com/repos/{repo}/issues"
 GITHUB_COMMITS_API_URL = "https://api.github.com/repos/{repo}/commits"
 GITHUB_RELEASES_API_URL = "https://api.github.com/repos/{repo}/releases"
@@ -43,7 +38,6 @@ DEFAULT_REPO_FILE = "data/github_default_repos.json"
 # Path for storing link resolution settings
 LINK_SETTINGS_FILE = "data/github_link_settings.json"
 
-
 @register(
     "astrbot_plugin_github_cards",
     "根据群聊中 GitHub 相关链接自动发送 GitHub OpenGraph 图片，支持订阅仓库的 Issue 和 PR",
@@ -57,7 +51,7 @@ class MyPlugin(Star):
         self.subscriptions = self._load_subscriptions()
         self.default_repos = self._load_default_repos()
         self.link_settings = self._load_link_settings()
-        self.last_check_time = {}  # Store the last check time for each repo
+        self.last_check_time = {}
         self.use_lowercase = self.config.get("use_lowercase_repo", True)
         self.auto_resolve_links = self.config.get("auto_resolve_links", True)
         self.github_token = self.config.get("github_token", "")
@@ -67,9 +61,13 @@ class MyPlugin(Star):
         self.webhook_port = int(self.config.get("webhook_port", 6192))
         self.webhook_secret = self.config.get("webhook_secret", "")
         self.webhook_path = self.config.get("webhook_path", "/github/webhook")
+        
+        # 新增配置项：只提醒直接操作
+        self.notify_only_direct_actions = self.config.get("notify_only_direct_actions", False)
+        
         self.webhook_server: Any | None = None
         self.task: asyncio.Task[Any] | None = None
-
+        
         if self.enable_webhook:
             server = GitHubWebhookServer(
                 plugin=self,
@@ -82,7 +80,6 @@ class MyPlugin(Star):
             server.start()
             logger.info("GitHub Cards Plugin 初始化完成，启用 Webhook 模式")
         else:
-            # Start background task to check for updates when webhook is disabled
             self.task = asyncio.create_task(self._check_updates_periodically())
             logger.info(
                 f"GitHub Cards Plugin初始化完成，检查间隔: {self.check_interval}分钟"
@@ -153,12 +150,10 @@ class MyPlugin(Star):
         """Resolve stored subscription key that matches the provided repo name."""
         if repo in self.subscriptions:
             return repo
-
         normalized = self._normalize_repo_name(repo)
         for stored_repo in self.subscriptions.keys():
             if self._normalize_repo_name(stored_repo) == normalized:
                 return stored_repo
-
         return None
 
     def _get_github_headers(self) -> dict[str, str]:
@@ -171,7 +166,6 @@ class MyPlugin(Star):
     @filter.regex(GITHUB_URL_PATTERN)
     async def github_repo(self, event: AstrMessageEvent):
         """解析 Github 仓库信息"""
-        # Check if link resolution is enabled for this conversation
         should_resolve = self.link_settings.get(
             event.unified_msg_origin, self.auto_resolve_links
         )
@@ -183,6 +177,7 @@ class MyPlugin(Star):
         if not match:
             logger.debug("未能在消息中解析到 GitHub 链接")
             return
+
         repo_url = match.group(0)
         repo_url = repo_url.replace("https://github.com/", "")
         hash_value = uuid.uuid4().hex
@@ -207,7 +202,6 @@ class MyPlugin(Star):
         enabled = state == "on"
         self.link_settings[event.unified_msg_origin] = enabled
         self._save_link_settings()
-
         status_text = "开启" if enabled else "关闭"
         yield event.plain_result(f"已在当前会话{status_text} GitHub 链接自动解析")
 
@@ -218,10 +212,8 @@ class MyPlugin(Star):
             yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
             return
 
-        # Normalize repository name
         normalized_repo = self._normalize_repo_name(repo)
-
-        # Check if the repo exists
+        
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -230,7 +222,6 @@ class MyPlugin(Star):
                     if resp.status != 200:
                         yield event.plain_result(f"仓库 {repo} 不存在或无法访问")
                         return
-
                     repo_data = await resp.json()
                     display_name = repo_data.get("full_name", repo)
         except Exception as e:
@@ -238,28 +229,23 @@ class MyPlugin(Star):
             yield event.plain_result(f"检查仓库时出错: {str(e)}")
             return
 
-        # Get the unique identifier for the subscriber
         subscriber_id = event.unified_msg_origin
-
         repo_key = self._resolve_repo_key(repo)
         if not repo_key:
             repo_key = normalized_repo if self.use_lowercase else display_name
 
         subscribers = self.subscriptions.setdefault(repo_key, [])
-
         if subscriber_id not in subscribers:
             subscribers.append(subscriber_id)
             self._save_subscriptions()
-
-            # Fetch initial state for new subscription
+            
             if not self.enable_webhook:
                 await self._fetch_new_items(repo_key, None)
-
+            
             yield event.plain_result(f"成功订阅仓库 {display_name} 的事件更新。")
         else:
             yield event.plain_result(f"你已经订阅了仓库 {display_name}")
 
-        # Set as default repo for this conversation
         self.default_repos[event.unified_msg_origin] = display_name
         self._save_default_repos()
 
@@ -267,9 +253,8 @@ class MyPlugin(Star):
     async def unsubscribe_repo(self, event: AstrMessageEvent, repo: str | None = None):
         """取消订阅 GitHub 仓库。例如: /ghunsub AstrBotDev/AstrBot，不提供仓库名则取消所有订阅"""
         subscriber_id = event.unified_msg_origin
-
+        
         if repo is None:
-            # Unsubscribe from all repos
             unsubscribed = []
             for repo_name, subscribers in list(self.subscriptions.items()):
                 if subscriber_id in subscribers:
@@ -277,7 +262,7 @@ class MyPlugin(Star):
                     unsubscribed.append(repo_name)
                     if not subscribers:
                         del self.subscriptions[repo_name]
-
+            
             if unsubscribed:
                 self._save_subscriptions()
                 yield event.plain_result(
@@ -307,11 +292,10 @@ class MyPlugin(Star):
         """列出当前订阅的 GitHub 仓库"""
         subscriber_id = event.unified_msg_origin
         subscribed_repos = []
-
         for repo, subscribers in self.subscriptions.items():
             if subscriber_id in subscribers:
                 subscribed_repos.append(repo)
-
+        
         if subscribed_repos:
             yield event.plain_result(
                 f"你当前订阅的仓库有: {', '.join(subscribed_repos)}"
@@ -323,7 +307,6 @@ class MyPlugin(Star):
     async def set_default_repo(self, event: AstrMessageEvent, repo: str | None = None):
         """设置默认仓库。例如: /ghdefault AstrBotDev/AstrBot"""
         if repo is None:
-            # Show current default repo
             default_repo = self.default_repos.get(event.unified_msg_origin)
             if default_repo:
                 yield event.plain_result(f"当前默认仓库为: {default_repo}")
@@ -337,7 +320,6 @@ class MyPlugin(Star):
             yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
             return
 
-        # Check if the repo exists
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -346,7 +328,6 @@ class MyPlugin(Star):
                     if resp.status != 200:
                         yield event.plain_result(f"仓库 {repo} 不存在或无法访问")
                         return
-
                     repo_data = await resp.json()
                     display_name = repo_data.get("full_name", repo)
         except Exception as e:
@@ -354,10 +335,10 @@ class MyPlugin(Star):
             yield event.plain_result(f"检查仓库时出错: {str(e)}")
             return
 
-        # Set as default repo for this conversation
         self.default_repos[event.unified_msg_origin] = display_name
         self._save_default_repos()
         yield event.plain_result(f"已将 {display_name} 设为默认仓库")
+
     def _is_valid_repo(self, repo: str) -> bool:
         """Check if the repository name is valid"""
         return bool(re.match(r"[\w\-]+/[\w\-]+$", repo))
@@ -374,9 +355,8 @@ class MyPlugin(Star):
                     await self._check_all_repos()
                 except Exception as e:
                     logger.error(f"检查仓库更新时出错: {e}")
-
-                # Use configured check interval
-                minutes = max(1, self.check_interval)  # Ensure at least 1 minute
+                
+                minutes = max(1, self.check_interval)
                 logger.debug(f"等待 {minutes} 分钟后再次检查仓库更新")
                 await asyncio.sleep(minutes * 60)
         except asyncio.CancelledError:
@@ -389,21 +369,14 @@ class MyPlugin(Star):
 
         for repo in list(self.subscriptions.keys()):
             logger.debug(f"正在检查仓库 {repo} 更新")
-            if not self.subscriptions[repo]:  # Skip if no subscribers
+            if not self.subscriptions[repo]:
                 continue
 
             try:
-                # Get the last check time for this repo
                 last_check = self.last_check_time.get(repo, None)
-
-                # Fetch new issues and PRs
                 new_items = await self._fetch_new_items(repo, last_check)
-
                 if new_items:
-                    # Update last check time
                     self.last_check_time[repo] = datetime.now().isoformat()
-
-                    # Notify subscribers about new items
                     await self._notify_subscribers(repo, new_items)
             except Exception as e:
                 logger.error(f"检查仓库 {repo} 更新时出错: {e}")
@@ -411,8 +384,6 @@ class MyPlugin(Star):
     async def _fetch_new_items(self, repo: str, last_check: str | None):
         """Fetch new issues, PRs, commits, and releases from a repository since last check"""
         if not last_check:
-            # If first time checking, just record current time and return empty list
-            # Store as UTC timestamp without timezone info to avoid comparison issues
             self.last_check_time[repo] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
@@ -420,12 +391,8 @@ class MyPlugin(Star):
             return []
 
         try:
-            # Always treat stored timestamps as UTC without timezone info
             last_check_dt = datetime.fromisoformat(last_check)
-
-            # Ensure it's treated as naive datetime
             if hasattr(last_check_dt, "tzinfo") and last_check_dt.tzinfo is not None:
-                # If it somehow has timezone info, convert to naive UTC
                 last_check_dt = last_check_dt.replace(tzinfo=None)
 
             logger.debug(f"仓库 {repo} 的上次检查时间: {last_check_dt.isoformat()}")
@@ -485,7 +452,6 @@ class MyPlugin(Star):
                                     if created_at > last_check_dt:
                                         logger.info(f"发现新的 commit {commit.get('sha')[:7]} in {repo}")
                                         commit["_astrbot_type"] = "commit"
-                                        # To pass branch info in notifier we can't easily get it here, but we can just say "代码推送"
                                         new_items.append(commit)
                                     else:
                                         break
@@ -498,7 +464,6 @@ class MyPlugin(Star):
                 # 3. Fetch Releases
                 try:
                     params_releases = {"per_page": 5}
-                    # releases API doesn't support 'since', we rely on sorting (default is by created_at desc)
                     async with session.get(
                         GITHUB_RELEASES_API_URL.format(repo=repo),
                         params=params_releases,
@@ -525,13 +490,11 @@ class MyPlugin(Star):
                 except Exception as e:
                     logger.error(f"获取仓库 {repo} 的 Releases 时出错: {e}")
 
-            # Update the last check time to now (UTC without timezone info)
             if new_items:
                 logger.info(f"找到 {len(new_items)} 个新的 items 在 {repo}")
             else:
                 logger.debug(f"没有找到新的 items 在 {repo}")
 
-            # Always update the timestamp after checking, regardless of whether we found items
             self.last_check_time[repo] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
@@ -554,11 +517,22 @@ class MyPlugin(Star):
             return
 
         repo_key = self._resolve_repo_key(repo) or repo
-
         for subscriber_id in self.subscriptions.get(repo_key, []):
             try:
-                # Create notification message
                 for item in new_items:
+                    # 检查是否只通知直接操作
+                    if self.notify_only_direct_actions:
+                        # 只通知直接创建的操作
+                        if "_astrbot_type" in item:
+                            # 对于 commit 和 release，总是通知
+                            pass
+                        else:
+                            # 对于 issue 和 pr，只通知 open 和 reopened 动作
+                            action = item.get("action", "")
+                            if action not in ["opened", "reopened"]:
+                                logger.debug(f"跳过非直接操作: {action}")
+                                continue
+                    
                     if "_astrbot_type" in item:
                         if item["_astrbot_type"] == "commit":
                             sha = item.get("sha", "")[:7]
@@ -583,7 +557,6 @@ class MyPlugin(Star):
                                 f"链接: {url}"
                             )
                         else:
-                            # Fallback if unknown type
                             continue
                     else:
                         item_type = "PR" if "pull_request" in item else "Issue"
@@ -594,12 +567,9 @@ class MyPlugin(Star):
                             f"链接: {item['html_url']}"
                         )
 
-                    # Send message to subscriber
                     await self.context.send_message(
                         subscriber_id, MessageChain(chain=[Comp.Plain(message)])
                     )
-
-                    # Add a small delay between messages to avoid rate limiting
                     await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"向订阅者 {subscriber_id} 发送通知时出错: {e}")
@@ -625,7 +595,7 @@ class MyPlugin(Star):
         repo_key = self._resolve_repo_key(repo_full_name)
         if not repo_key:
             logger.debug(
-                f"忽略仓库 {repo_full_name} 的 Webhook 事件 {event_type}: 未找到对应订阅"
+                f"忽略仓库 {repo_full_name} 事件 {event_type}: 未找到对应订阅"
             )
             return
 
@@ -639,6 +609,21 @@ class MyPlugin(Star):
         sender = payload.get("sender")
         action = payload.get("action", "")
         message: str | None = None
+
+        # 检查是否只通知直接操作
+        if self.notify_only_direct_actions:
+            if event_type in ["issues", "pull_request"]:
+                if action not in ["opened", "reopened"]:
+                    logger.debug(f"跳过非直接操作: {event_type} - {action}")
+                    return
+            elif event_type in ["issue_comment", "pull_request_review_comment"]:
+                # 评论属于间接操作，不通知
+                logger.debug(f"跳过评论操作: {event_type}")
+                return
+            elif event_type in ["commit_comment", "discussion", "discussion_comment"]:
+                # 这些也属于间接操作，不通知
+                logger.debug(f"跳过间接操作: {event_type}")
+                return
 
         if event_type == "issues":
             issue = payload.get("issue")
@@ -668,9 +653,9 @@ class MyPlugin(Star):
         elif event_type == "discussion":
             discussion = payload.get("discussion")
             if isinstance(discussion, dict):
-                message = formatters.format_webhook_discussion_message(
+                message =过滤(formatters.format_webhook_discussion_message(
                     repo_full_name, action, discussion, sender
-                )
+                ))
         elif event_type == "discussion_comment":
             discussion = payload.get("discussion")
             comment = payload.get("comment")
@@ -694,13 +679,13 @@ class MyPlugin(Star):
             review = payload.get("review")
             if isinstance(pull_request, dict) and isinstance(review, dict):
                 message = formatters.format_webhook_pr_review_message(
-                    repo_full_name, action, pull_request, review, sender
+                    repo_full_name, action, pull_request, review
                 )
         elif event_type == "pull_request_review_thread":
             pull_request = payload.get("pull_request")
             thread = payload.get("thread")
             if isinstance(pull_request, dict) and isinstance(thread, dict):
-                message = formatters.format_webhook_pr_review_thread_message(
+                message = formatters.filter_webhook_pr_review_thread_message(
                     repo_full_name, action, pull_request, thread, sender
                 )
         elif event_type == "star":
@@ -758,11 +743,9 @@ class MyPlugin(Star):
                 )
                 return
 
-            # Format and send the issue details
             result = formatters.format_issue_details(repo, issue_data)
             yield event.plain_result(result)
 
-            # Send the issue card image if available
             if issue_data.get("html_url"):
                 hash_value = uuid.uuid4().hex
                 url_path = issue_data["html_url"].replace("https://github.com/", "")
@@ -773,7 +756,6 @@ class MyPlugin(Star):
                     yield event.image_result(card_url)
                 except Exception as e:
                     logger.error(f"下载 Issue 卡片图片失败: {e}")
-
         except Exception as e:
             logger.error(f"获取 Issue 详情时出错: {e}")
             yield event.plain_result(f"获取 Issue 详情时出错: {str(e)}")
@@ -796,22 +778,19 @@ class MyPlugin(Star):
                 )
                 return
 
-            # Format and send the PR details
             result = formatters.format_pr_details(repo, pr_data)
             yield event.plain_result(result)
 
-            # Send the PR card image if available
             if pr_data.get("html_url"):
                 hash_value = uuid.uuid4().hex
                 url_path = pr_data["html_url"].replace("https://github.com/", "")
                 card_url = GITHUB_REPO_OPENGRAPH.format(
-                    hash=hash_value, appendix=url_path
+                    hash=hash_value, pr_number=pr_number, appendix=url_path
                 )
                 try:
                     yield event.image_result(card_url)
                 except Exception as e:
                     logger.error(f"下载 PR 卡片图片失败: {e}")
-
         except Exception as e:
             logger.error(f"获取 PR 详情时出错: {e}")
             yield event.plain_result(f"获取 PR 详情时出错: {str(e)}")
@@ -820,29 +799,23 @@ class MyPlugin(Star):
         self, reference: str, msg_origin: str | None = None
     ) -> tuple[str | None, str | None]:
         """Parse issue/PR reference string in various formats"""
-        # Try format 'owner/repo#number' or 'owner/repo number'
         match = re.match(r"([\w\-]+/[\w\-]+)(?:#|\s+)(\d+)$", reference)
         if match:
             return match.group(1), match.group(2)
 
-        # Try format 'owner/repo/number' (without spaces)
         match = re.match(r"([\w\-]+/[\w\-]+)/(\d+)$", reference)
         if match:
             return match.group(1), match.group(2)
 
-        # If reference is just a number, try to use default repo or a subscribed repo
         if reference.isdigit():
-            # First check for default repo for this conversation
             if msg_origin and msg_origin in self.default_repos:
                 return self.default_repos[msg_origin], reference
 
-            # Next check if there's exactly one subscription
             if msg_origin:
                 user_subscriptions = []
                 for repo, subscribers in self.subscriptions.items():
                     if msg_origin in subscribers:
                         user_subscriptions.append(repo)
-
                 if len(user_subscriptions) == 1:
                     return user_subscriptions[0], reference
                 elif len(user_subscriptions) > 1:
@@ -854,7 +827,6 @@ class MyPlugin(Star):
 
     def _parse_readme_reference(self, reference: str) -> str | None:
         """Parse readme reference string."""
-        # Match 'owner/repo' and optional '#...' or ' ...' part
         match = re.match(r"([\w\-]+/[\w\-]+)", reference)
         if match:
             return match.group(1)
@@ -876,7 +848,6 @@ class MyPlugin(Star):
                 )
                 return
 
-            # Decode content from base64
             content_base64 = readme_data.get("content", "")
             try:
                 readme_content = base64.b64decode(content_base64).decode("utf-8")
@@ -885,20 +856,15 @@ class MyPlugin(Star):
                 yield event.plain_result(f"解码仓库 {repo} 的 README 内容时出错")
                 return
 
-            # **[REMOVED]** Truncation logic is removed.
-
             header = f"📖 {repo} 的 README\n\n"
             full_text = header + readme_content
 
-            # Render text to image
             try:
                 image_url = await self.text_to_image(full_text)
                 yield event.image_result(image_url)
             except Exception as e:
                 logger.error(f"渲染 README 图片失败: {e}")
-                # Fallback to plain text if image rendering fails
                 yield event.plain_result(full_text)
-
         except Exception as e:
             logger.error(f"获取 README 详情时出错: {e}")
             yield event.plain_result(f"获取 README 详情时出错: {str(e)}")
@@ -937,7 +903,7 @@ class MyPlugin(Star):
                 logger.error(f"获取 Issue {repo}#{issue_number} 时出错: {e}")
                 return None
 
-    async def _fetch_pr_data(self, repo: str, pr_number: str) -> dict[str, Any] | None:
+    async def _fetch_pr_data(self, repo: str, pr_number: str) -> -> dict[str, Any] | None:
         """Fetch PR data from GitHub API"""
         async with aiohttp.ClientSession() as session:
             try:
@@ -961,10 +927,8 @@ class MyPlugin(Star):
                 yield event.plain_result("无法获取 GitHub API 速率限制信息")
                 return
 
-            # Format and send the rate limit details
             result = self._format_rate_limit(rate_limit_data)
             yield event.plain_result(result)
-
         except Exception as e:
             logger.error(f"获取 API 速率限制信息时出错: {e}")
             yield event.plain_result(f"获取 API 速率限制信息时出错: {str(e)}")
@@ -995,55 +959,35 @@ class MyPlugin(Star):
         search = resources.get("search", {})
         graphql = resources.get("graphql", {})
 
-        # Convert timestamps to datetime objects
         core_reset = datetime.fromtimestamp(core.get("reset", 0))
         search_reset = datetime.fromtimestamp(search.get("reset", 0))
         graphql_reset = datetime.fromtimestamp(graphql.get("reset", 0))
 
-        # Calculate time until reset
         now = datetime.now()
         core_minutes = max(0, (core_reset - now).total_seconds() // 60)
         search_minutes = max(0, (search_reset - now).total_seconds() // 60)
         graphql_minutes = max(0, (graphql_reset - now).total_seconds() // 60)
 
-        # Format the result
         result = (
             "📊 GitHub API 速率限制状态\n\n"
             "💻 核心 API (repositories, issues, etc):\n"
             f"  剩余请求数: {core.get('remaining', 0)}/{core.get('limit', 0)}\n"
-            f"  重置时间: {core_reset.strftime('%H:%M:%S')} (约 {int(core_minutes)} 分钟后)\n\n"
+            f"  新限制时间: {core_reset.strftime('%H:%M:%S')} (约 {int(core_minutes)} 分钟后)\n\n"
             "🔍 搜索 API:\n"
             f"  剩余请求数: {search.get('remaining', 0)}/{search.get('limit', 0)}\n"
             f"  重置时间: {search_reset.strftime('%H:%M:%S')} (约 {int(search_minutes)} 分钟后)\n\n"
             "📈 GraphQL API:\n"
-            f"  剩余请求数: {graphql.get('remaining', 0)}/{graphql.get('limit', 0)}\n"
+            f"  剩余请求数: {graphql.get('remaining', 0)}/{graphql.get('limit', 0)}\信息获取"
             f"  重置时间: {graphql_reset.strftime('%H:%M:%S')} (约 {int(graphql_minutes)} 分钟后)\n"
         )
 
-        # Add information about authentication status
         if self.github_token:
             result += "\n✅ 已使用 GitHub Token 进行身份验证，速率限制较高"
         else:
             result += (
                 "\n⚠️ 未使用 GitHub Token，速率限制较低。可在配置中添加 Token 以提高限制"
             )
-
         return result
-
-    # TODO: svg2png
-    # @filter.command("ghstar")
-    # async def ghstar(self, event: AstrMessageEvent, identifier: str):
-    #     '''查看 GitHub 仓库的 Star 趋势图。如: /ghstar AstrBotDev/AstrBot'''
-    #     url = STAR_HISTORY_URL.format(identifier=identifier)
-    #     # download svg
-    #     fpath = "data/temp/{identifier}.svg".format(identifier=identifier.replace("/",
-    #         "_"))
-    #     await download_file(url, fpath)
-    #     # convert to png
-    #     png_fpath = fpath.replace(".svg", ".png")
-    #     cairosvg.svg2png(url=fpath, write_to=png_fpath)
-    #     # send image
-    #     yield event.image_result(png_fpath)
 
     async def terminate(self):
         """Cleanup and save data before termination"""
@@ -1056,7 +1000,6 @@ class MyPlugin(Star):
                 await self.task
             except asyncio.CancelledError:
                 pass
-
         if self.webhook_server:
             await self.webhook_server.stop()
         logger.info("GitHub Cards Plugin 已终止")
