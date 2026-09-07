@@ -221,11 +221,16 @@ class MyPlugin(Star):
         logger.info(f"生成的 OpenGraph URL: {opengraph_url}")
 
         try:
-            yield event.image_result(opengraph_url)
-        except Exception as e:
-            logger.error(f"下载图片失败: {e}")
-            yield event.plain_result("下载 GitHub 图片失败: " + str(e))
-            return
+            sent = await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain([Comp.Image.fromURL(opengraph_url)]),
+            )
+            if sent is False:
+                logger.warning("GitHub 卡片未发送：未找到匹配的平台适配器")
+        except Exception:
+            # 旁路发送卡片失败不应阻断原消息事件与后续的大模型处理流程
+            logger.exception("发送 GitHub 卡片失败，保留原消息后续处理")
+        return
 
     @filter.command("ghlink")
     async def set_link_resolution(self, event: AstrMessageEvent, state: str):
